@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codelor-color"
+version = "2.1.0"
+description = "A lightweight PyTorch Transformer architecture for Chroma Key (Green Screen)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "PlimbAi", email = "plimb.ai.contact@gmail.com"}
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/Plimb-ai/codelor-color"
+"Bug Tracker" = "https://github.com/Plimb-ai/codelor-color/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["codelor_color*"]
