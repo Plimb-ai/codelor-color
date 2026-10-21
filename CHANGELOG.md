@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.2.2] - 2026-10-21
+
+Patch release fixing the remaining mypy error from CI.
+
+### Fixed
+
+- `SobelEdge` declares its `sx`/`sy` buffers with class annotations so mypy
+  types them as `Tensor` (previously `Tensor | Module`, which broke
+  `F.conv2d`). No behaviour change: buffers and `state_dict` keys are identical.
+
 ## [2.2.1] - 2026-10-21
 
 Patch release: the 2.2.0 files already on PyPI cannot be replaced (PyPI
@@ -21,9 +31,6 @@ change; weights and API are identical to 2.2.0.
 - Lint errors reported by the GitHub Actions CI on the 2.2.0 tag.
 - `CodelorColor._get()` now casts `nn.ModuleList` lookups so mypy accepts
   the weight-tying indirection.
-- `SobelEdge` declares its `sx`/`sy` buffers with class annotations so mypy
-  types them as `Tensor` (previously `Tensor | Module`, which broke
-  `F.conv2d`).
 
 ## [2.2.0] - 2026-10-21
 
