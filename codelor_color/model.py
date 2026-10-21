@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 #: Default reference color used when none is supplied (RGB in [0, 1]).
-DEFAULT_REF_RGB: Tuple[float, float, float] = (0.20, 0.85, 0.30)
+DEFAULT_REF_RGB: tuple[float, float, float] = (0.20, 0.85, 0.30)
 
 #: Channel width of the stem feature maps at 1/4 (``f4``) resolution.
 STEM_W1: int = 32
@@ -42,7 +43,7 @@ POS_EMB_STD: float = 0.02
 EPS: float = 1e-6
 
 #: Hyper-parameters accepted by :meth:`CodelorColor.config` / ``config.json``.
-HYPERPARAM_KEYS: Tuple[str, ...] = (
+HYPERPARAM_KEYS: tuple[str, ...] = (
     "dim",
     "depth",
     "heads",
@@ -108,7 +109,7 @@ class DropPath(nn.Module):
         return x * mask / keep
 
 
-def rope_2d(q: Tensor, k: Tensor, h: int, w: int, base: float = ROPE_BASE) -> Tuple[Tensor, Tensor]:
+def rope_2d(q: Tensor, k: Tensor, h: int, w: int, base: float = ROPE_BASE) -> tuple[Tensor, Tensor]:
     """Apply 2D rotary position embeddings, splitting the head dim in half for x and y."""
     B, Hh, N, D = q.shape
     d4 = D // 4
@@ -243,7 +244,7 @@ class ConvNeXtStem(nn.Module):
         self.down8 = AntiAliasDownsample(STEM_W1, STEM_W2)
         self.down16 = AntiAliasDownsample(STEM_W2, dim)
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.patch(x)
         x = x + self.block1(x)
         f4 = x
@@ -304,7 +305,7 @@ class GatedDecoder(nn.Module):
 
     def forward(
         self, latent: Tensor, f4: Tensor, f8: Tensor, img: Tensor, ref_rgb: Tensor
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         B, _, H, W = img.shape
         x = self.proj16(latent)
         aux = self.aux_head(x)
@@ -380,14 +381,13 @@ class CodelorColor(nn.Module):
         self.norm_out = RMSNorm(dim)
         self.decoder = GatedDecoder(dim)
 
-    def _get(self, i: int) -> Tuple[Block, ColorCrossAttention]:
-        if self.tied_after > 0 and i >= self.tied_after:
-            return self.blocks[i - self.tied_after], self.color_xattn[i - self.tied_after]
-        return self.blocks[i], self.color_xattn[i]
+    def _get(self, i: int) -> tuple[Block, ColorCrossAttention]:
+        idx = i - self.tied_after if self.tied_after > 0 and i >= self.tied_after else i
+        return cast(Block, self.blocks[idx]), cast(ColorCrossAttention, self.color_xattn[idx])
 
     def forward(
         self, img: Tensor, ref_rgb: Tensor, return_aux: bool = False
-    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Predict foreground logits.
 
         Args:
@@ -435,7 +435,7 @@ class CodelorColor(nn.Module):
         main, aux = self.decoder(latent, f4, f8, img, ref_rgb)
         return (main, aux) if return_aux else main
 
-    def config(self) -> Dict[str, Any]:
+    def config(self) -> dict[str, Any]:
         """Return the hyper-parameters needed to rebuild this model.
 
         The result is accepted both directly and nested under a
@@ -464,7 +464,7 @@ class CodelorColor(nn.Module):
 # ============================================================
 
 def load_from_pretrained(
-    path_or_repo: Union[str, Path], device: Union[str, torch.device] = "cpu"
+    path_or_repo: str | Path, device: str | torch.device = "cpu"
 ) -> CodelorColor:
     """Build a :class:`CodelorColor` and load ``model.safetensors`` from it.
 
@@ -513,7 +513,7 @@ def load_from_pretrained(
     return model.eval().to(device)
 
 
-def _as_batch(image_tensor: Tensor, name: str = "image_tensor") -> Tuple[Tensor, bool]:
+def _as_batch(image_tensor: Tensor, name: str = "image_tensor") -> tuple[Tensor, bool]:
     """Validate an image tensor and return it with a batch dimension plus a squeeze flag."""
     if not isinstance(image_tensor, Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(image_tensor).__name__}")
@@ -547,10 +547,10 @@ def _sync_model_device(model: nn.Module, device: torch.device) -> None:
 def predict_mask(
     model: nn.Module,
     image_tensor: Tensor,
-    color_rgb: Optional[Sequence[float]] = None,
+    color_rgb: Sequence[float] | None = None,
     threshold: float = 0.5,
-    device: Union[str, torch.device] = "cpu",
-) -> Tuple[Any, Any]:
+    device: str | torch.device = "cpu",
+) -> tuple[Any, Any]:
     """Compute a foreground mask for an image.
 
     Args:
@@ -592,9 +592,9 @@ def predict_mask(
 def remove_green(
     image_tensor: Tensor,
     model: nn.Module,
-    color_rgb: Optional[Sequence[float]] = None,
+    color_rgb: Sequence[float] | None = None,
     threshold: float = 0.5,
-    device: Union[str, torch.device] = "cpu",
+    device: str | torch.device = "cpu",
 ) -> Tensor:
     """Return an RGBA tensor where the alpha channel is ``1 - P(foreground)``.
 

@@ -23,6 +23,12 @@ Architecture weights are unchanged: checkpoints trained for 2.1.0 load as-is.
 - Test suite (`tests/`), GitHub Actions CI, ruff/mypy/pytest configuration.
 - Changelog.
 
+### Changed
+
+- Python 3.8/3.9 support dropped: `requires-python` is now `>=3.10`
+  (matching current PyTorch). Annotations use modern syntax
+  (`tuple[...]`, `X | Y`, `collections.abc.Sequence`).
+
 ### Fixed
 
 - `config()` → `load_from_pretrained()` round-trip (`KeyError` on

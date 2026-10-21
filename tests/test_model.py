@@ -6,7 +6,7 @@ import json
 import re
 import warnings
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import numpy as np
 import pytest
@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def small_model(**kwargs) -> CodelorColor:
-    params: Dict[str, Any] = dict(
+    params: dict[str, Any] = dict(
         dim=32, depth=2, heads=4, tied_after=1, max_tokens=64, drop_path_rate=0.1
     )
     params.update(kwargs)

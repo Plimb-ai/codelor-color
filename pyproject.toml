@@ -7,7 +7,7 @@ name = "codelor-color"
 dynamic = ["version"]
 description = "A lightweight PyTorch Transformer architecture for Chroma Key (Green Screen)."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
     {name = "PlimbAi", email = "plimb.ai.contact@gmail.com"}
@@ -50,7 +50,7 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py38"
+target-version = "py310"
 exclude = ["build", "dist"]
 
 [tool.ruff.lint]
@@ -58,6 +58,6 @@ select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 ignore_missing_imports = true
 check_untyped_defs = true
