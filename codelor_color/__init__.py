@@ -1,9 +1,17 @@
+from ._version import __version__
 from .model import (
+    DEFAULT_REF_RGB,
     CodelorColor,
     load_from_pretrained,
     predict_mask,
-    remove_green
+    remove_green,
 )
 
-__version__ = "2.1.0"
-__all__ = ["CodelorColor", "load_from_pretrained", "predict_mask", "remove_green"]
+__all__ = [
+    "DEFAULT_REF_RGB",
+    "CodelorColor",
+    "load_from_pretrained",
+    "predict_mask",
+    "remove_green",
+    "__version__",
+]

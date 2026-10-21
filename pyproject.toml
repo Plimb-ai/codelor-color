@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codelor-color"
-version = "2.1.0"
+dynamic = ["version"]
 description = "A lightweight PyTorch Transformer architecture for Chroma Key (Green Screen)."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -18,7 +18,19 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "torch>=2.0.0"
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+hf = [
+    "huggingface_hub>=0.20.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.8.0",
 ]
 
 [project.urls]
@@ -28,3 +40,24 @@ Homepage = "https://github.com/Plimb-ai/codelor-color"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["codelor_color*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "codelor_color._version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.8"
+ignore_missing_imports = true
+check_untyped_defs = true

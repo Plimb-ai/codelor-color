@@ -1,7 +1,12 @@
+# Runtime dependencies (kept in sync with pyproject.toml)
 torch>=2.0.0
-safetensors>=0.4.0
 numpy>=1.24.0
-pillow>=10.0.0
-matplotlib>=3.7.0
-tqdm>=4.65.0
-opencv-python>=4.8.0
+safetensors>=0.4.0
+
+# Optional: Hugging Face Hub download support (pip install codelor-color[hf])
+# huggingface_hub>=0.20.0
+
+# Development tools (pip install -e ".[dev]")
+pytest>=7.0.0
+ruff>=0.4.0
+mypy>=1.8.0
