@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.2.1] - 2026-10-21
+
+Patch release: the 2.2.0 files already on PyPI cannot be replaced (PyPI
+releases are immutable), so the CI/lint fixes ship as 2.2.1. No behaviour
+change; weights and API are identical to 2.2.0.
+
+### Changed
+
+- Python 3.8/3.9 support dropped: `requires-python` is now `>=3.10`
+  (matching current PyTorch). The 2.2.0 metadata on PyPI still advertises
+  `>=3.8`.
+- Annotations use modern syntax (`tuple[...]`, `X | Y`,
+  `collections.abc.Sequence`) required by current ruff (UP006/UP007/UP045).
+
+### Fixed
+
+- Lint errors reported by the GitHub Actions CI on the 2.2.0 tag.
+- `CodelorColor._get()` now casts `nn.ModuleList` lookups so mypy accepts
+  the weight-tying indirection.
+
 ## [2.2.0] - 2026-10-21
 
 Architecture weights are unchanged: checkpoints trained for 2.1.0 load as-is.
@@ -22,12 +42,6 @@ Architecture weights are unchanged: checkpoints trained for 2.1.0 load as-is.
 - `CodelorColor.config()` now also returns `drop_path_rate`.
 - Test suite (`tests/`), GitHub Actions CI, ruff/mypy/pytest configuration.
 - Changelog.
-
-### Changed
-
-- Python 3.8/3.9 support dropped: `requires-python` is now `>=3.10`
-  (matching current PyTorch). Annotations use modern syntax
-  (`tuple[...]`, `X | Y`, `collections.abc.Sequence`).
 
 ### Fixed
 
