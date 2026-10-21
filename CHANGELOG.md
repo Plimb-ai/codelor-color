@@ -21,6 +21,9 @@ change; weights and API are identical to 2.2.0.
 - Lint errors reported by the GitHub Actions CI on the 2.2.0 tag.
 - `CodelorColor._get()` now casts `nn.ModuleList` lookups so mypy accepts
   the weight-tying indirection.
+- `SobelEdge` declares its `sx`/`sy` buffers with class annotations so mypy
+  types them as `Tensor` (previously `Tensor | Module`, which broke
+  `F.conv2d`).
 
 ## [2.2.0] - 2026-10-21
 
