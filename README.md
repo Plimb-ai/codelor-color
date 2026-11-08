@@ -116,6 +116,12 @@ Training is resumable: `runs/codelor/last.pt` is written atomically every
 continues from it (`--no-resume` to start over). The result is exported to
 `runs/codelor/final` (and `best` when a validation split is used).
 
+Training extras: weight EMA (exported by default, `--no-ema`), BatchNorm
+statistics frozen when fine-tuning with small batches, random crop / flip /
+brightness-contrast augmentation, in-RAM image cache (fast epochs with 0
+workers), L1 alpha loss for soft edges. New models default to `--preset v3`;
+`--init-from` keeps the checkpoint's architecture unless `--preset` is given.
+
 From Python:
 
     from codelor_color.training import TrainConfig, Trainer
@@ -162,11 +168,55 @@ installed, weights are saved to `model.pt` and `load_from_pretrained` reads it.
   prototype tokens and the decoder drops the color-similarity channel.
 - Optional gradient checkpointing (`model.set_grad_checkpointing(True)`) to train with less RAM.
 
+### Presets: `v2` (original) and `v3` (improved)
+
+`CodelorColor()` with default arguments is **exactly** the original
+architecture (`plimb/codelor-color-1.2` loads and gives the same masks).
+The `v3` preset fixes its structural weaknesses; it needs new weights
+(train from scratch, or `--init-from` a v2 checkpoint with `--preset v3` to
+reuse the stem and Transformer weights):
+
+| | `v2` (default, compatible) | `v3` |
+|---|---|---|
+| Color conditioning | cross-attention to **one** token (the softmax is always 1, so it is just a constant bias) | FiLM scale + shift in every block |
+| Positions | learned table indexed by flat token index (wrong when the resolution or aspect ratio changes, disabled above `max_tokens`) | RoPE only: any resolution |
+| Normalization | BatchNorm (noisy with batch 2 on a phone) | GroupNorm (batch-size independent) |
+| Decoder guides | RGB cosine to the key color | + CbCr chroma distance (ignores shadows) |
+| Full-resolution head | two 3x3 convs on 69 channels per pixel (memory bound, most of the CPU time) | half-resolution head + 8-channel full-resolution refinement |
+| Background model | 4 constant learned tokens | FiLM from a global context vector of the image |
+
+    from codelor_color import build_model
+    model = build_model("color", preset="v3")        # or "background"
+
+For v2 models used at another resolution than their training one,
+`model.set_pos_grid((10, 10))` (grid of a 160x160 training) interpolates the
+learned positions in 2D: identical output at the training resolution, correct
+positions elsewhere. The trainer records it automatically for new v2 models.
+
+### Faster inference
+
+    from codelor_color.model import optimize_for_inference
+    fast = optimize_for_inference(model)                  # BatchNorm folded, same output
+    fast = optimize_for_inference(model, quantize=True)   # + int8 Transformer (ARM/Termux)
+    mask, prob = predict_mask(fast, img, max_side=512)    # big images: run at <= 512 px
+    rgba = remove_green(img, fast, despill_strength=0.8)  # remove green fringes
+
+Same weights as `codelor-color-1.2`, 4 CPU threads:
+
+| Input | 2.2.2 | 2.3.0 | 2.3.0 + `optimize_for_inference` |
+|---|---|---|---|
+| 160x160 | 32 ms | 22 ms | 17 ms |
+| 320x320 | 102 ms | 61 ms | 60 ms |
+| 512x512 | 252 ms | 203 ms | 170 ms |
+
+A `v3` model of the same size (1.38 M parameters) runs 320x320 in ~40 ms
+and 512x512 in ~90 ms on the same machine.
+
 Notes:
 
 - The learned positional embedding table holds `max_tokens` tokens (default 1024).
   Larger inputs still run, but raise a `RuntimeWarning` because the positional
-  embeddings are skipped beyond that capacity.
+  embeddings are skipped beyond that capacity (use `set_pos_grid`, or `v3`).
 - `predict_mask` and `remove_green` switch the model to eval mode and run under
   `torch.inference_mode()`.
 

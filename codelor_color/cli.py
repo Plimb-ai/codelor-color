@@ -58,6 +58,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
         "img_size": args.img_size, "num_threads": args.threads, "num_workers": args.workers,
         "device": args.device, "val_split": args.val_split, "seed": args.seed,
         "save_every": args.save_every, "log_every": args.log_every,
+        "preset": args.preset, "ema_decay": args.ema_decay,
     }
     data.update({k: v for k, v in mapping.items() if v is not None})
     if args.no_resume:
@@ -66,6 +67,14 @@ def _cmd_train(args: argparse.Namespace) -> int:
         data["grad_checkpointing"] = True
     if args.invert_masks:
         data["invert_masks"] = True
+    if args.no_ema:
+        data["ema_decay"] = None
+    if args.freeze_bn is not None:
+        data["freeze_bn"] = args.freeze_bn == "on"
+    if args.no_cache:
+        data["cache"] = False
+    if args.no_augment:
+        data["augment"] = False
     model_kw = dict(data.get("model", {"dim": 128, "depth": 8, "heads": 8, "tied_after": 4}))
     for key in ("dim", "depth", "heads", "tied_after"):
         if getattr(args, key) is not None:
@@ -80,11 +89,21 @@ def _cmd_predict(args: argparse.Namespace) -> int:
     import torch.nn.functional as F
 
     from .device import resolve_device
-    from .model import load_from_pretrained, remove_background
+    from .model import (
+        DEFAULT_REF_RGB,
+        despill,
+        load_from_pretrained,
+        optimize_for_inference,
+        remove_green,
+    )
     from .training import load_image, save_image
 
     device = resolve_device(args.device)
     model = load_from_pretrained(args.model, device=device)
+    if args.pos_grid:
+        model.set_pos_grid(args.pos_grid)
+    if not args.no_optimize:
+        model = optimize_for_inference(model, quantize=args.int8)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     for src in args.inputs:
@@ -94,14 +113,17 @@ def _cmd_predict(args: argparse.Namespace) -> int:
         if args.size:
             x = F.interpolate(img[None], size=(args.size, args.size), mode="bilinear",
                               align_corners=False)[0]
-        rgba = remove_background(x, model, threshold=args.threshold, device=device,
-                                 color_rgb=args.color)
-        alpha = rgba[3:]
-        if args.size:
+        alpha = remove_green(x, model, color_rgb=args.color, threshold=args.threshold,
+                             device=device, max_side=args.max_side)[3:]
+        if alpha.shape[-2:] != (h, w):
             alpha = F.interpolate(alpha[None], size=(h, w), mode="bilinear",
                                   align_corners=False)[0]
+        alpha = alpha.clamp(0, 1)
+        rgb = img
+        if args.despill > 0 and model.needs_color:
+            rgb = despill(img, alpha, args.color or DEFAULT_REF_RGB, args.despill)
         dst = out_dir / (Path(src).stem + ".png")
-        save_image(torch.cat([img, alpha.clamp(0, 1)], 0), dst)
+        save_image(torch.cat([rgb, alpha], 0), dst)
         print(f"{src} -> {dst}")
     return 0
 
@@ -142,6 +164,15 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--grad-checkpointing", action="store_true", help="lower RAM, slower")
     t.add_argument("--invert-masks", action="store_true", help="masks are white = remove")
     t.add_argument("--no-resume", action="store_true", help="ignore out/last.pt")
+    t.add_argument("--preset", choices=["v2", "v3"],
+                   help="architecture: v3 (default from scratch, faster, resolution-free) "
+                        "or v2 (original). With --init-from: convert the checkpoint")
+    t.add_argument("--ema-decay", type=float, help="weight EMA decay (default 0.999)")
+    t.add_argument("--no-ema", action="store_true", help="export raw weights instead of EMA")
+    t.add_argument("--freeze-bn", choices=["on", "off"],
+                   help="freeze BatchNorm stats (default: on when fine-tuning with batch < 8)")
+    t.add_argument("--no-cache", action="store_true", help="do not keep images in RAM")
+    t.add_argument("--no-augment", action="store_true", help="disable crop/flip/jitter")
 
     p = sub.add_parser("predict", help="cut out images, writes RGBA PNGs")
     p.add_argument("inputs", nargs="+")
@@ -151,6 +182,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="key color for color models (#22dd44 or r,g,b)")
     p.add_argument("--size", type=int, default=None, help="inference resolution (square)")
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--max-side", type=int, default=None,
+                   help="run the model with the longest side resized to this (faster)")
+    p.add_argument("--despill", type=float, default=0.0,
+                   help="color models: remove key-color fringes, strength 0..1")
+    p.add_argument("--int8", action="store_true", help="int8 quantized Transformer (CPU/ARM)")
+    p.add_argument("--no-optimize", action="store_true", help="skip BatchNorm fusion")
+    p.add_argument("--pos-grid", type=int, nargs=2, metavar=("ROWS", "COLS"),
+                   help="v2 models: token grid used in training (10 10 for 160px) to "
+                        "fix positions at other resolutions")
     p.add_argument("--device", default="auto")
     return parser
 

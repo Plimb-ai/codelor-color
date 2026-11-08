@@ -80,7 +80,7 @@ def test_predict_and_remove_background() -> None:
 def test_save_and_load_pretrained_keeps_task(tmp_path: Path, cls: type[CodelorColor]) -> None:
     model = cls(**SMALL)
     save_pretrained(model, tmp_path)
-    assert json.loads((tmp_path / "config.json").read_text())["task"] == model.task
+    assert json.loads((tmp_path / "config.json").read_text())["codelor_task"] == model.task
     loaded = load_from_pretrained(tmp_path)
     assert type(loaded) is cls
     for k, v in model.state_dict().items():

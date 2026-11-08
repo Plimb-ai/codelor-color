@@ -5,7 +5,58 @@ All notable changes to this project are documented in this file.
 ## [2.3.0] - 2026-11-08
 
 Nothing was removed: `CodelorColor` weights, parameter names and the existing
-API are unchanged (existing checkpoints load as-is).
+API are unchanged. `plimb/codelor-color-1.2` loads and gives the same masks
+(max logit difference 4e-5, 100% identical mask pixels, checked against the
+Hub's `modeling_codelor.py`).
+
+### Fixed
+
+- `load_from_pretrained` failed on Hub configs such as `plimb/codelor-color-1.2`
+  (`"task": "image-segmentation"`): the task is now read from `codelor_task`,
+  then `architectures`, then `task` only when it is a Codelor task.
+- Trainer: `GradScaler` fallback for torch < 2.3; leftover gradient
+  accumulation micro-batches at the end of an epoch are no longer dropped;
+  validation uses non-augmented images.
+
+### Performance (same weights, same outputs)
+
+- `rope_2d` sin/cos tables cached per token grid.
+- Single-token color cross-attention computed in closed form (softmax over one
+  key is 1): no query projection / QK-norm / attention for the color path.
+- Color cosine guide computed with plain reductions (`F.cosine_similarity` on an
+  expanded map was 23% of the CPU time at 512 px).
+- `optimize_for_inference()`: BatchNorm folded into convolutions, optional int8
+  dynamic quantization (`quantize=True`, for ARM/Termux) and `channels_last`.
+- Measured on 4 CPU threads, codelor-color-1.2: 160 px 32 -> 17 ms,
+  320 px 102 -> 60 ms, 512 px 252 -> 170 ms.
+- `predict_mask(..., max_side=N)` runs big images at a reduced resolution and
+  upsamples the probability.
+
+### Added: architecture preset "v3" (opt-in, new weights)
+
+- `build_model(task, preset="v3")` / `--preset v3` (default when training from
+  scratch; fine-tuning keeps the checkpoint's architecture unless `--preset`
+  is given, in which case matching weights are transferred).
+- FiLM color conditioning instead of the degenerate one-token cross-attention;
+  for background removal, FiLM driven by a global context vector of the image.
+- RoPE-only positions: any resolution / aspect ratio, no `max_tokens` limit.
+- GroupNorm: independent of the batch size (Termux trains with batch 2).
+- CbCr chroma-distance guide (robust to shadows on green screens).
+- Light head: last decoder stage at half resolution + 8-channel full-resolution
+  refinement; ~2x faster than v2 at 320-512 px.
+- For original-architecture models: `set_pos_grid((rows, cols))` / `pos_grid`
+  interpolates the learned positions in 2D, identical at the training
+  resolution and correct at others; set automatically by the trainer.
+
+### Added: training
+
+- EMA of the weights (`ema_decay`, exported by default), BatchNorm statistics
+  frozen when fine-tuning with small batches (`freeze_bn`), random resized
+  crop + flip + brightness/contrast augmentation, in-RAM image cache, subject
+  scale/position randomization for composites, L1 alpha loss term.
+- `despill()` and `remove_green(..., despill_strength=...)` / `predict --despill`.
+- CLI: `--preset`, `--no-ema`, `--freeze-bn`, `--no-cache`, `--no-augment`;
+  `predict --max-side --despill --int8 --pos-grid`.
 
 ### Added
 
@@ -13,9 +64,9 @@ API are unchanged (existing checkpoints load as-is).
   backbone, learned background tokens instead of a target color. `build_model(task)`,
   `TASKS`, `remove_background()`, `CodelorBackground.from_color_model()` and
   `transfer_weights()` to fine-tune from a chroma-key checkpoint.
-- `save_pretrained()`; `load_from_pretrained()` reads the `"task"` key of
-  `config.json` (default `"color"`) and falls back to `model.pt` when
-  safetensors is not available.
+- `save_pretrained()` (writes `codelor_task` + `architectures`);
+  `load_from_pretrained()` falls back to `model.pt` when safetensors is not
+  available.
 - `codelor_color.training`: resumable `Trainer` / `TrainConfig`, folder,
   composite (RGBA cut-outs) and synthetic datasets, BCE + Dice + deep supervision loss.
 - `codelor_color.device`: Termux/Android detection and per-platform training
