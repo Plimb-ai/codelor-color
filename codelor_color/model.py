@@ -3,6 +3,15 @@
 The model takes an image ``img`` of shape ``(B, 3, H, W)`` and a target color
 ``ref_rgb`` of shape ``(B, 3)`` and returns a per-pixel logit map ``(B, 1, H, W)``.
 Apply ``torch.sigmoid`` to obtain foreground probabilities.
+
+Two tasks share the same backbone (see :data:`TASKS`):
+
+* ``"color"`` -- :class:`CodelorColor`, removes a *target color* (chroma key).
+* ``"background"`` -- :class:`CodelorBackground`, removes the *background*
+  whatever its color (no reference color needed).
+
+Both predict the probability of each pixel being *removed*, so the same
+inference (:func:`predict_mask`) and training code applies to both.
 """
 
 from __future__ import annotations
@@ -18,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +62,13 @@ HYPERPARAM_KEYS: tuple[str, ...] = (
     "max_tokens",
     "drop_path_rate",
 )
+
+#: Model families: ``"color"`` removes a target color, ``"background"`` removes the background.
+TASKS: tuple[str, ...] = ("color", "background")
+#: Task assumed when a ``config.json`` does not specify one (all pre-2.3 checkpoints).
+DEFAULT_TASK: str = "color"
+#: Number of learned conditioning tokens used by :class:`CodelorBackground`.
+BG_COND_TOKENS: int = 4
 
 
 # ============================================================
@@ -277,10 +294,15 @@ class GatedDecoder(nn.Module):
 
     At full resolution it concatenates ``[decoded, raw image, cosine-similarity to the
     target color, Sobel edge map]`` before the prediction head.
+
+    With ``color_guided=False`` (background removal) the cosine-similarity channel
+    is dropped since there is no target color.
     """
 
-    def __init__(self, dim: int) -> None:
+    def __init__(self, dim: int, color_guided: bool = True) -> None:
         super().__init__()
+        self.color_guided = color_guided
+        n_guides = 3 + 1 + (1 if color_guided else 0)  # image + edge (+ cosine)
         self.proj16 = nn.Conv2d(dim, dim, 1, bias=False)
         self.aux_head = nn.Conv2d(dim, 1, 1)
         self.up8 = nn.Sequential(
@@ -294,7 +316,7 @@ class GatedDecoder(nn.Module):
             nn.SiLU(inplace=True),
         )
         self.up1 = nn.Sequential(
-            nn.Conv2d(STEM_W2 + 3 + 1 + 1, STEM_W1, 3, padding=1, bias=False),
+            nn.Conv2d(STEM_W2 + n_guides, STEM_W1, 3, padding=1, bias=False),
             nn.BatchNorm2d(STEM_W1),
             nn.SiLU(inplace=True),
             nn.Conv2d(STEM_W1, STEM_W1, 3, padding=1, bias=False),
@@ -307,7 +329,7 @@ class GatedDecoder(nn.Module):
         self.edge = SobelEdge()
 
     def forward(
-        self, latent: Tensor, f4: Tensor, f8: Tensor, img: Tensor, ref_rgb: Tensor
+        self, latent: Tensor, f4: Tensor, f8: Tensor, img: Tensor, ref_rgb: Tensor | None
     ) -> tuple[Tensor, Tensor]:
         B, _, H, W = img.shape
         x = self.proj16(latent)
@@ -318,11 +340,16 @@ class GatedDecoder(nn.Module):
         x = F.interpolate(x, size=f4.shape[-2:], mode="bilinear", align_corners=False)
         x = self.up4(torch.cat([x, torch.sigmoid(self.gate4) * f4], 1))
         x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
-        ref_map = ref_rgb.view(B, 3, 1, 1).expand(B, 3, H, W)
-        cos = F.cosine_similarity(img, ref_map, dim=1, eps=EPS).unsqueeze(1)
         gray = img.mean(1, keepdim=True)
         edge = self.edge(gray)
-        x = self.up1(torch.cat([x, img, cos, edge], 1))
+        if self.color_guided:
+            if ref_rgb is None:
+                raise ValueError("a color-guided decoder needs ref_rgb")
+            ref_map = ref_rgb.view(B, 3, 1, 1).expand(B, 3, H, W)
+            cos = F.cosine_similarity(img, ref_map, dim=1, eps=EPS).unsqueeze(1)
+            x = self.up1(torch.cat([x, img, cos, edge], 1))
+        else:
+            x = self.up1(torch.cat([x, img, edge], 1))
         return self.head(x), aux
 
 
@@ -341,6 +368,11 @@ class CodelorColor(nn.Module):
     The model returns ``(B, 1, H, W)`` logits, or ``((B, 1, H, W), (B, 1, h4, w4))``
     when ``return_aux=True``.
     """
+
+    #: Task identifier written to ``config.json`` (see :data:`TASKS`).
+    task: str = "color"
+    #: Whether :meth:`forward` requires a ``ref_rgb`` target color.
+    needs_color: bool = True
 
     def __init__(
         self,
@@ -366,11 +398,12 @@ class CodelorColor(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.max_tokens = max_tokens
         self.drop_path_rate = drop_path_rate
+        #: Recompute Transformer activations in backward to save RAM (training only).
+        #: Not saved in ``config()``; enable it with :meth:`set_grad_checkpointing`.
+        self.grad_checkpointing = False
         self._pos_warned = False
         self.stem = ConvNeXtStem(dim)
-        self.color_mlp = nn.Sequential(
-            nn.Linear(3, dim), nn.SiLU(inplace=True), nn.Linear(dim, dim)
-        )
+        self._build_conditioning(dim)
         self.pos = nn.Parameter(torch.zeros(1, max_tokens, dim))
         nn.init.trunc_normal_(self.pos, std=POS_EMB_STD)
         n_unique = depth if tied_after <= 0 else min(depth, tied_after)
@@ -382,20 +415,35 @@ class CodelorColor(nn.Module):
             [ColorCrossAttention(dim, heads) for _ in range(n_unique)]
         )
         self.norm_out = RMSNorm(dim)
-        self.decoder = GatedDecoder(dim)
+        self.decoder = GatedDecoder(dim, color_guided=self.needs_color)
+
+    # -- conditioning hooks (overridden by CodelorBackground) -----------------
+
+    def _build_conditioning(self, dim: int) -> None:
+        """Create the modules producing the cross-attention conditioning tokens."""
+        self.color_mlp = nn.Sequential(
+            nn.Linear(3, dim), nn.SiLU(inplace=True), nn.Linear(dim, dim)
+        )
+
+    def _condition(self, ref_rgb: Tensor | None, batch: int) -> Tensor:
+        """Return the ``(B, M, dim)`` conditioning tokens for the color cross-attention."""
+        if ref_rgb is None:
+            raise ValueError("CodelorColor needs ref_rgb of shape (B, 3)")
+        return cast(Tensor, self.color_mlp(ref_rgb)).unsqueeze(1)
 
     def _get(self, i: int) -> tuple[Block, ColorCrossAttention]:
         idx = i - self.tied_after if self.tied_after > 0 and i >= self.tied_after else i
         return cast(Block, self.blocks[idx]), cast(ColorCrossAttention, self.color_xattn[idx])
 
     def forward(
-        self, img: Tensor, ref_rgb: Tensor, return_aux: bool = False
+        self, img: Tensor, ref_rgb: Tensor | None = None, return_aux: bool = False
     ) -> Tensor | tuple[Tensor, Tensor]:
         """Predict foreground logits.
 
         Args:
             img: ``(B, 3, H, W)`` float tensor, values in ``[0, 1]``.
-            ref_rgb: ``(B, 3)`` target color in RGB ``[0, 1]``.
+            ref_rgb: ``(B, 3)`` target color in RGB ``[0, 1]`` (required for the
+                ``"color"`` task, ignored by :class:`CodelorBackground`).
             return_aux: also return the 1/4-resolution deep-supervision logit.
 
         Returns:
@@ -403,12 +451,18 @@ class CodelorColor(nn.Module):
         """
         if img.ndim != 4 or img.shape[1] != 3:
             raise ValueError(f"img must have shape (B, 3, H, W), got {tuple(img.shape)}")
-        if ref_rgb.ndim != 2 or ref_rgb.shape[1] != 3:
-            raise ValueError(f"ref_rgb must have shape (B, 3), got {tuple(ref_rgb.shape)}")
-        if ref_rgb.shape[0] != img.shape[0]:
-            raise ValueError(
-                f"batch mismatch: img has {img.shape[0]} samples, ref_rgb has {ref_rgb.shape[0]}"
-            )
+        if self.needs_color:
+            if ref_rgb is None:
+                raise ValueError("ref_rgb is required for the 'color' task, shape (B, 3)")
+            if ref_rgb.ndim != 2 or ref_rgb.shape[1] != 3:
+                raise ValueError(f"ref_rgb must have shape (B, 3), got {tuple(ref_rgb.shape)}")
+            if ref_rgb.shape[0] != img.shape[0]:
+                raise ValueError(
+                    f"batch mismatch: img has {img.shape[0]} samples, "
+                    f"ref_rgb has {ref_rgb.shape[0]}"
+                )
+        else:
+            ref_rgb = None
 
         B = img.shape[0]
         f4, f8, f16 = self.stem(img)
@@ -427,16 +481,25 @@ class CodelorColor(nn.Module):
                 self._pos_warned = True
         else:
             tokens = tokens + self.pos[:, :N]
-        c_tok = self.color_mlp(ref_rgb).unsqueeze(1)
+        c_tok = self._condition(ref_rgb, B)
         x = tokens
         for i in range(self.depth):
             blk, xa = self._get(i)
-            x = blk(x, h, w)
-            x = x + xa(x, c_tok)
+            if self.grad_checkpointing and self.training and torch.is_grad_enabled():
+                x = cast(Tensor, checkpoint(blk, x, h, w, use_reentrant=False))
+                x = x + cast(Tensor, checkpoint(xa, x, c_tok, use_reentrant=False))
+            else:
+                x = blk(x, h, w)
+                x = x + xa(x, c_tok)
         x = self.norm_out(x)
         latent = x.transpose(1, 2).reshape(B, -1, h, w)
         main, aux = self.decoder(latent, f4, f8, img, ref_rgb)
         return (main, aux) if return_aux else main
+
+    def set_grad_checkpointing(self, enabled: bool = True) -> CodelorColor:
+        """Trade compute for memory during training (useful on phones / small GPUs)."""
+        self.grad_checkpointing = enabled
+        return self
 
     def config(self) -> dict[str, Any]:
         """Return the hyper-parameters needed to rebuild this model.
@@ -456,20 +519,120 @@ class CodelorColor(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"dim={self.dim}, depth={self.depth}, heads={self.heads}, "
+            f"task={self.task}, dim={self.dim}, depth={self.depth}, heads={self.heads}, "
             f"tied_after={self.tied_after}, mlp_ratio={self.mlp_ratio}, "
             f"max_tokens={self.max_tokens}"
         )
+
+
+class CodelorBackground(CodelorColor):
+    """Background-removal model: same backbone as :class:`CodelorColor`, no target color.
+
+    Instead of a color token, the cross-attention attends to :data:`BG_COND_TOKENS`
+    learned "background prototype" tokens, and the decoder drops the
+    color-similarity channel. The output is the logit of each pixel being
+    *background* (i.e. to be removed), exactly like the color model predicts the
+    pixels of the key color, so :func:`predict_mask` / :func:`remove_background`
+    and the training loop work unchanged.
+
+    ``ref_rgb`` is accepted by :meth:`forward` for API compatibility but ignored.
+    The constructor takes the same hyper-parameters as :class:`CodelorColor`.
+    """
+
+    task = "background"
+    needs_color = False
+
+    def _build_conditioning(self, dim: int) -> None:
+        self.bg_tokens = nn.Parameter(torch.zeros(1, BG_COND_TOKENS, dim))
+        nn.init.trunc_normal_(self.bg_tokens, std=POS_EMB_STD)
+
+    def _condition(self, ref_rgb: Tensor | None, batch: int) -> Tensor:
+        return self.bg_tokens.expand(batch, -1, -1)
+
+    @classmethod
+    def from_color_model(cls, color_model: CodelorColor) -> CodelorBackground:
+        """Build a background model initialized from a trained color model.
+
+        The stem, Transformer blocks and most of the decoder are shared, so
+        fine-tuning from a chroma-key checkpoint converges much faster than
+        training from scratch (handy on low-power devices such as Termux).
+        """
+        model = cls(**color_model.config())
+        transfer_weights(color_model, model)
+        return model
+
+
+#: Mapping ``task name -> model class``.
+MODEL_CLASSES: dict[str, type[CodelorColor]] = {
+    "color": CodelorColor,
+    "background": CodelorBackground,
+}
 
 
 # ============================================================
 # FONCTIONS UTILITAIRES
 # ============================================================
 
+def build_model(task: str = DEFAULT_TASK, **hyperparams: Any) -> CodelorColor:
+    """Instantiate the model for ``task`` (``"color"`` or ``"background"``).
+
+    Example::
+
+        model = build_model("background", dim=128, depth=8)
+    """
+    if task not in MODEL_CLASSES:
+        raise ValueError(f"unknown task {task!r}, expected one of {TASKS}")
+    return MODEL_CLASSES[task](**hyperparams)
+
+
+def transfer_weights(src: nn.Module, dst: nn.Module) -> list[str]:
+    """Copy every parameter/buffer of ``src`` whose name and shape match into ``dst``.
+
+    Returns the list of copied keys. Useful to initialize a
+    :class:`CodelorBackground` from a :class:`CodelorColor` checkpoint.
+    """
+    src_state = src.state_dict()
+    dst_state = dst.state_dict()
+    copied = [
+        k for k, v in src_state.items() if k in dst_state and dst_state[k].shape == v.shape
+    ]
+    dst.load_state_dict({**dst_state, **{k: src_state[k] for k in copied}})
+    logger.info("Transferred %d/%d tensors", len(copied), len(dst_state))
+    return copied
+
+
+def save_pretrained(model: CodelorColor, directory: str | Path, **extra: Any) -> Path:
+    """Write ``config.json`` + ``model.safetensors`` so :func:`load_from_pretrained` can reload.
+
+    Extra keyword arguments are stored in ``config.json`` next to the
+    hyper-parameters (e.g. training metadata). If ``safetensors`` is not
+    installed (some Termux setups), the weights are written to ``model.pt``
+    with :func:`torch.save` instead.
+    """
+    out = Path(directory)
+    out.mkdir(parents=True, exist_ok=True)
+    cfg = {"task": model.task, "hyperparameters": model.config(), **extra}
+    (out / "config.json").write_text(json.dumps(cfg, indent=2))
+    state = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+    try:
+        from safetensors.torch import save_file
+    except ImportError:
+        logger.warning("safetensors not installed: saving weights to model.pt instead")
+        torch.save(state, out / "model.pt")
+    else:
+        save_file(state, str(out / "model.safetensors"))
+    return out
+
+
 def load_from_pretrained(
     path_or_repo: str | Path, device: str | torch.device = "cpu"
 ) -> CodelorColor:
-    """Build a :class:`CodelorColor` and load ``model.safetensors`` from it.
+    """Build a :class:`CodelorColor` (or :class:`CodelorBackground`) and load its weights.
+
+    The model class is picked from the ``"task"`` key of ``config.json``
+    (``"color"`` when absent, so every existing checkpoint keeps loading).
+    ``model.safetensors`` is preferred; ``model.pt`` (written by
+    :func:`save_pretrained` without safetensors) is used as a fallback.
 
     Args:
         path_or_repo: local directory containing ``config.json`` and
@@ -499,19 +662,26 @@ def load_from_pretrained(
     hyper = cfg.get("hyperparameters", cfg) if isinstance(cfg, dict) else None
     if not isinstance(hyper, dict):
         raise ValueError(f"Unexpected config.json structure in {config_path}")
-    unknown = sorted(set(hyper) - set(HYPERPARAM_KEYS))
+    unknown = sorted(set(hyper) - set(HYPERPARAM_KEYS) - {"task"})
     if unknown:
         logger.warning("Ignoring unknown hyper-parameters in %s: %s", config_path, unknown)
     params = {k: hyper[k] for k in HYPERPARAM_KEYS if k in hyper}
-    logger.info("Building CodelorColor from %s with %s", config_path, params)
-    model = CodelorColor(**params)
+    task = cfg.get("task", hyper.get("task", DEFAULT_TASK))
+    if task not in MODEL_CLASSES:
+        raise ValueError(f"Unknown task {task!r} in {config_path}, expected one of {TASKS}")
+    logger.info("Building %s from %s with %s", MODEL_CLASSES[task].__name__, config_path, params)
+    model = build_model(task, **params)
 
     weights_path = p / "model.safetensors"
-    if not weights_path.is_file():
-        raise FileNotFoundError(f"model.safetensors not found in {p}")
-    from safetensors.torch import load_file
+    fallback_path = p / "model.pt"
+    if weights_path.is_file():
+        from safetensors.torch import load_file
 
-    state = load_file(str(weights_path))
+        state = load_file(str(weights_path))
+    elif fallback_path.is_file():
+        state = torch.load(fallback_path, map_location="cpu", weights_only=True)
+    else:
+        raise FileNotFoundError(f"model.safetensors not found in {p}")
     model.load_state_dict(state, strict=True)
     return model.eval().to(device)
 
@@ -622,3 +792,23 @@ def remove_green(
     else:
         alpha = alpha.unsqueeze(1)
     return torch.cat([img_cpu, alpha.to(img_cpu.dtype)], dim=0 if img_cpu.ndim == 3 else 1)
+
+
+def remove_background(
+    image_tensor: Tensor,
+    model: nn.Module,
+    threshold: float = 0.5,
+    device: str | torch.device = "cpu",
+    color_rgb: Sequence[float] | None = None,
+) -> Tensor:
+    """Return an RGBA tensor whose alpha is ``1 - P(removed)``.
+
+    Works with both model families: with a :class:`CodelorBackground` the
+    background is removed (``color_rgb`` is ignored), with a
+    :class:`CodelorColor` the target color is removed (same as
+    :func:`remove_green`).
+
+    Returns:
+        ``(4, H, W)`` or ``(B, 4, H, W)`` float tensor on CPU.
+    """
+    return remove_green(image_tensor, model, color_rgb, threshold, device)

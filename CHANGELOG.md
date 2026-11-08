@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.3.0] - 2026-11-08
+
+Nothing was removed: `CodelorColor` weights, parameter names and the existing
+API are unchanged (existing checkpoints load as-is).
+
+### Added
+
+- **Background removal model** `CodelorBackground` (task `"background"`): same
+  backbone, learned background tokens instead of a target color. `build_model(task)`,
+  `TASKS`, `remove_background()`, `CodelorBackground.from_color_model()` and
+  `transfer_weights()` to fine-tune from a chroma-key checkpoint.
+- `save_pretrained()`; `load_from_pretrained()` reads the `"task"` key of
+  `config.json` (default `"color"`) and falls back to `model.pt` when
+  safetensors is not available.
+- `codelor_color.training`: resumable `Trainer` / `TrainConfig`, folder,
+  composite (RGBA cut-outs) and synthetic datasets, BCE + Dice + deep supervision loss.
+- `codelor_color.device`: Termux/Android detection and per-platform training
+  profiles (threads, workers, batch/accumulation, AMP).
+- Termux support: `scripts/termux_setup.sh`, atomic checkpoints, `SIGTERM`
+  handling, optional gradient checkpointing (`set_grad_checkpointing`).
+- `codelor-color` command (`info`, `train`, `predict`) and `python -m codelor_color`.
+- `train` extra (Pillow).
+- CI: Termux-like smoke training, package build + `twine check`, and automatic
+  PyPI publication + GitHub release on `main` when the version is new.
+
 ## [2.2.2] - 2026-10-21
 
 Patch release fixing the remaining mypy error from CI.
