@@ -212,6 +212,20 @@ Same weights as `codelor-color-1.2`, 4 CPU threads:
 A `v3` model of the same size (1.38 M parameters) runs 320x320 in ~40 ms
 and 512x512 in ~90 ms on the same machine.
 
+Quality check, v2 vs v3 trained the same way (250 steps on the built-in
+synthetic data, 96 px, CPU). IoU of the removed region at 96 px / 160x128:
+
+| Task | Batch | v2 | v3 | Training speed v2 -> v3 |
+|---|---|---|---|---|
+| color | 2 x 4 (Termux) | 0.976 / 0.971 | 0.975 / 0.971 | 259 -> 227 ms/step |
+| color | 8 | 0.976 / 0.975 | 0.975 / 0.971 | 215 -> 107 ms/step |
+| background | 2 x 4 (Termux) | 0.683 / 0.678 | 0.696 / 0.667 | 227 -> 161 ms/step |
+| background | 8 | 0.664 / 0.668 | 0.696 / 0.667 | 153 -> 107 ms/step |
+
+So on this benchmark v3 matches v2 (slightly better for background removal at
+the training resolution) while being up to 2x faster to train and to run.
+Synthetic data is easy: compare both on your own images before switching.
+
 Notes:
 
 - The learned positional embedding table holds `max_tokens` tokens (default 1024).
