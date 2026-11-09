@@ -171,8 +171,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--invert-masks", action="store_true", help="masks are white = remove")
     t.add_argument("--no-resume", action="store_true", help="ignore out/last.pt")
     t.add_argument("--preset", choices=["v2", "v3", "v4"],
-                   help="architecture: v3 (default from scratch, faster, resolution-free) "
-                        "or v2 (original). With --init-from: convert the checkpoint")
+                   help="architecture: v4 (default from scratch: as accurate as v2, better "
+                        "alpha, ~2x faster, any resolution), v3, or v2 (original). "
+                        "With --init-from: convert the checkpoint")
     t.add_argument("--ema-decay", type=float, help="weight EMA decay (default 0.999)")
     t.add_argument("--no-ema", action="store_true", help="export raw weights instead of EMA")
     t.add_argument("--freeze-bn", choices=["on", "off"],

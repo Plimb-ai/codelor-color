@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.4.0] - 2026-11-09
+
+Nothing removed; `plimb/codelor-color-1.2` (v2) and v3 checkpoints from 2.3.0
+load unchanged.
+
+### Added
+
+- **Preset `v4`** (new default for models trained from scratch): v3 with
+  BatchNorm. Chosen by an ablation on harder synthetic data, see the README:
+  same IoU as v2 for chroma key and background removal (also with Termux-sized
+  batches of 2), 1.6-2.4x lower alpha error, correct at any resolution, ~2x
+  faster than v2 at 320-512 px, and its BatchNorm folds at inference.
+- `predict_mask(..., refine="guided")` / `predict --refine guided`: guided
+  filter / guided upsampling of the alpha (chroma guide for color models).
+  Works with any model; measured gain is small, off by default.
+- Training: `edge_weight` (extra BCE weight on mask borders, default 1.0),
+  multi-scale batches (`multiscale`, on by default for resolution-independent
+  models: +1.9 IoU points at an unseen resolution), `synthetic_hard`.
+- CLI: `--preset v4`, `--edge-weight`, `--multiscale`, `--synthetic-hard`,
+  `predict --refine`.
+
+### Fixed
+
+- Synthetic background-removal data used the same kind of texture for the
+  subject and the background, so models only learned "everything is
+  background". Subjects are now in focus, shaded and cast a shadow over a
+  blurred background. The v2/v3 background numbers published in the 2.3.0
+  README were measured on that data and were meaningless; they are replaced.
+
+### Changed
+
+- The 2.3.0 claim "v3 matches v2" did not hold on harder data: v3 loses
+  0.4-1.7 IoU points, which the ablation traced to GroupNorm. v3 is kept for
+  compatibility; use v4 for new models.
+
 ## [2.3.0] - 2026-11-08
 
 Nothing was removed: `CodelorColor` weights, parameter names and the existing

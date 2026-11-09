@@ -469,7 +469,7 @@ class TrainConfig:
     out_dir: str = "runs/codelor"
     init_from: str | None = None         # local dir or HF repo to fine-tune from
     resume: bool = True                  # resume from out_dir/last.pt if present
-    # Architecture preset ("v2" original / "v3" improved). None: "v3" from
+    # Architecture preset ("v2" original / "v3" / "v4" recommended). None: "v4" from
     # scratch, the checkpoint's own architecture with init_from. An explicit
     # preset with init_from converts the checkpoint (matching weights reused).
     preset: str | None = None
@@ -659,7 +659,7 @@ class Trainer:
     def _build_model(self) -> CodelorColor:
         c = self.cfg
         if not c.init_from:
-            model = build_model(c.task, preset=c.preset or "v3", **c.model)
+            model = build_model(c.task, preset=c.preset or "v4", **c.model)
             if model.pos_mode == "learned":
                 # Record the training token grid: other resolutions then get
                 # interpolated (correct) positions instead of a wrong flat index.
