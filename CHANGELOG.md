@@ -14,12 +14,19 @@ unchanged (1.2 re-checked: 100% identical masks).
   in the benchmark (README), ~20% faster inference at 320-512 px and 5-16%
   faster training steps.
 - CLI: `--preset v5`.
+- `scripts/train_codelor_color_bg.py`: trains `codelor-color-bg-1.2`, a
+  background-removal model, on real photos from torchvision (Oxford-IIIT Pet,
+  Pascal VOC 2012) starting from `plimb/codelor-color-1.2`; held-out score,
+  sample cut-outs, model card, optional Hugging Face upload. Works on Termux.
 
 ### Fixed
 
 - Weight tying with `depth > 2 * tied_after` (e.g. `depth=12, tied_after=4`)
   raised `IndexError`; shared blocks are now reused cyclically. Unchanged for
   `depth <= 2 * tied_after`, which covers every existing checkpoint.
+- Fine-tuning with small batches froze the BatchNorm statistics of every
+  layer, including layers that are new after a preset or task conversion;
+  only layers fully loaded from the checkpoint are frozen now.
 
 ## [2.4.0] - 2026-11-09
 

@@ -144,3 +144,17 @@ def test_trainer_defaults_to_v5(tmp_path: Path) -> None:
                       img_size=32, num_threads=1, num_workers=0, device="cpu",
                       val_split=0.0, synthetic_length=2, model=dict(SMALL), resume=False)
     assert Trainer(cfg, log=lambda _m: None).model.head == "quarter"
+
+
+def test_freeze_bn_only_pretrained_layers(tmp_path: Path) -> None:
+    save_pretrained(build_model("color", **SMALL), tmp_path / "src")
+    cfg = TrainConfig(task="background", init_from=str(tmp_path / "src"), preset="v5",
+                      out_dir=str(tmp_path / "r"), max_steps=1, batch_size=2, img_size=32,
+                      num_threads=1, num_workers=0, device="cpu", val_split=0.0,
+                      synthetic_length=2, model=dict(SMALL), resume=False)
+    trainer = Trainer(cfg, log=lambda _m: None)
+    assert trainer.freeze_bn
+    trainer._train_mode()
+    bns = {n: m for n, m in trainer.model.named_modules() if isinstance(m, torch.nn.BatchNorm2d)}
+    assert not bns["stem.patch.1"].training          # transferred from the checkpoint: frozen
+    assert bns["decoder.up1.1"].training   # follows a new conv (other guides): keeps learning

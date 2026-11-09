@@ -134,6 +134,18 @@ All options (`--batch-size`, `--accum-steps`, `--img-size`, `--threads`,
 `--workers`, `--device`, `--grad-checkpointing`, `--dim`, ...) can also be
 put in a JSON file passed with `--config`.
 
+### Ready-made recipe: background removal on real photos
+
+`scripts/train_codelor_color_bg.py` downloads real photos with their masks
+through torchvision (Oxford-IIIT Pet, Pascal VOC 2012), fine-tunes
+`plimb/codelor-color-1.2` into a background-removal model named
+`codelor-color-bg-1.2`, scores it on held-out photos and writes sample
+cut-outs and a model card (works on Termux; resumes after an interruption):
+
+    python scripts/train_codelor_color_bg.py --update   # update codelor-color
+    python scripts/train_codelor_color_bg.py            # prepare data + train
+    python scripts/train_codelor_color_bg.py --push-to <user>/codelor-color-bg-1.2
+
 ## 📱 Training on Termux (Android)
 
 PyTorch has no Android wheels on PyPI, so install it from the Termux repos and
