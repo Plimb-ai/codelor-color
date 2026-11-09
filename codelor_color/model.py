@@ -123,7 +123,7 @@ BG_COND_TOKENS: int = 4
 _COND_MODES = ("xattn", "film")
 _POS_MODES = ("learned", "interp", "none")
 _NORMS = ("bn", "gn")
-_HEADS = ("conv", "light")
+_HEADS = ("conv", "light", "quarter")
 
 
 # ============================================================
@@ -444,7 +444,9 @@ class GatedDecoder(nn.Module):
             raise ValueError(f"head must be one of {_HEADS}, got {head!r}")
         self.color_guided = color_guided
         self.chroma_guide = chroma_guide and color_guided
-        self.light = head == "light"
+        self.light = head != "conv"
+        #: Resolution divisor of the last decoder stage (1 = full resolution).
+        self.head_stride = {"conv": 1, "light": 2, "quarter": 4}[head]
         # image + edge (+ cosine) (+ chroma distance)
         n_guides = 3 + 1 + (1 if color_guided else 0) + (1 if self.chroma_guide else 0)
         self.proj16 = nn.Conv2d(dim, dim, 1, bias=False)
@@ -506,9 +508,10 @@ class GatedDecoder(nn.Module):
             x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
             x = self.up1(torch.cat([x, *self._guides(img, ref_rgb)], 1))
             return self.head(x), aux
-        half = F.avg_pool2d(img, 2, ceil_mode=True)
-        x = F.interpolate(x, size=half.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.up1(torch.cat([x, *self._guides(half, ref_rgb)], 1))
+        low = F.avg_pool2d(img, self.head_stride, ceil_mode=True)
+        if x.shape[-2:] != low.shape[-2:]:
+            x = F.interpolate(x, size=low.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.up1(torch.cat([x, *self._guides(low, ref_rgb)], 1))
         logit = F.interpolate(self.head(x), size=(H, W), mode="bilinear", align_corners=False)
         logit = logit + self.refine(torch.cat([logit, *self._guides(img, ref_rgb)], 1))
         return logit, aux
