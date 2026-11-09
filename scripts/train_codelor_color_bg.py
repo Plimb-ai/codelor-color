@@ -261,12 +261,14 @@ def make_safe_trainer(base):
 
     class SafeTrainer(base):
         skipped = 0
+        in_a_row = 0
 
         def _optimizer_step(self) -> None:
             self.scaler.unscale_(self.opt)
             norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
             if not math.isfinite(float(norm)):
                 self.skipped += 1
+                self.in_a_row += 1
                 if self.scaler.is_enabled():
                     self.scaler.step(self.opt)  # skipped by the scaler, which lowers its scale
                     self.scaler.update()
@@ -278,9 +280,10 @@ def make_safe_trainer(base):
                 if bad and (self.out / "last.pt").is_file():
                     log(f"  {len(bad)} statistics became NaN: reloading last checkpoint")
                     self.load_checkpoint(self.out / "last.pt")
-                if self.skipped >= 50:
-                    raise RuntimeError("too many non-finite steps: lower --lr")
+                if self.in_a_row >= 20:  # occasional skips are harmless, a streak is not
+                    raise RuntimeError("20 non-finite steps in a row: lower --lr")
                 return
+            self.in_a_row = 0
             self.scaler.step(self.opt)
             self.scaler.update()
             self.opt.zero_grad(set_to_none=True)
@@ -501,6 +504,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, mps")
     p.add_argument("--from-scratch", action="store_true",
                    help=f"do not start from {BASE_MODEL}")
+    p.add_argument("--blas-threads", type=int,
+                   help="OpenBLAS threads (default on Termux: 1, avoids NaN)")
     p.add_argument("--export-to", help="copy the finished model (folder + single "
                                        ".safetensors file) to this folder, e.g. a mounted "
                                        "Google Drive")
@@ -516,6 +521,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if is_termux() or args.blas_threads:
+        # Termux's multi-threaded OpenBLAS ("BLAS : Bad memory unallocation!")
+        # can return garbage, which shows up as NaN gradients. One BLAS thread
+        # per call is the safe setting; must be set before torch is imported.
+        n = str(args.blas_threads or 1)
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", n)
+        log(f"OPENBLAS_NUM_THREADS={os.environ['OPENBLAS_NUM_THREADS']}")
     if args.update:
         update_packages()
         return 0
