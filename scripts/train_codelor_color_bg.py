@@ -50,6 +50,9 @@ DATASETS = ("pets", "voc")
 STORE_SIDE = 384
 #: Held-out photos (never trained on) used for the final score and the samples.
 N_TEST = 200
+#: Free disk space needed to download + extract each dataset (bytes).
+PETS_SPACE = int(2.0e9)
+VOC_SPACE = int(4.5e9)
 
 
 def log(msg: str) -> None:
@@ -154,7 +157,44 @@ def export_pairs(dataset, to_mask, dst: Path, prefix: str, test: Path | None = N
     return n
 
 
-def prepare_data(names: list[str], raw: Path, data: Path, test: Path) -> int:
+def _marker(data: Path, name: str) -> Path:
+    return data / f".{name}_done"
+
+
+def _exported(data: Path, name: str, raw_paths: list[Path]) -> bool:
+    """True if ``name`` was exported (marker, or exported files and no raw download left)."""
+    if _marker(data, name).is_file():
+        return True
+    has_files = any((data / "images").glob(f"{name}_*.jpg"))
+    return has_files and not any(p.exists() for p in raw_paths)
+
+
+def _remove(paths: list[Path]) -> None:
+    for p in paths:
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            p.unlink()
+
+
+def _done(data: Path, name: str, raw_paths: list[Path], keep_raw: bool) -> None:
+    _marker(data, name).write_text("ok\n")
+    if not keep_raw:
+        _remove(raw_paths)  # photos are exported: the archives only take space
+        log(f"  {name}: raw download deleted (use --keep-raw to keep it)")
+
+
+def _enough_space(path: Path, need: int, label: str) -> bool:
+    path.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(path).free
+    if free < need:
+        log(f"{label} skipped: {free / 1e9:.1f} GB free, about {need / 1e9:.1f} GB needed")
+        return False
+    return True
+
+
+def prepare_data(names: list[str], raw: Path, data: Path, test: Path,
+                 keep_raw: bool = False) -> int:
     from torchvision import datasets as tvd
 
     for root in (data, test):
@@ -162,20 +202,31 @@ def prepare_data(names: list[str], raw: Path, data: Path, test: Path) -> int:
         (root / "masks").mkdir(parents=True, exist_ok=True)
     total = 0
     if "pets" in names:
-        log("Oxford-IIIT Pet: download (~800 MB the first time) and export...")
-        for split in ("trainval", "test"):
-            ds = tvd.OxfordIIITPet(str(raw), split=split, target_types="segmentation",
-                                   download=True)
-            total += export_pairs(ds, pets_mask, data, f"pets_{split}",
-                                  test if split == "test" else None, N_TEST)
+        pets_raw = [raw / "oxford-iiit-pet"]
+        if _exported(data, "pets", pets_raw):
+            log("Oxford-IIIT Pet: already prepared")
+        elif _enough_space(raw, PETS_SPACE, "Oxford-IIIT Pet"):
+            log("Oxford-IIIT Pet: download (~800 MB the first time) and export...")
+            for split in ("trainval", "test"):
+                ds = tvd.OxfordIIITPet(str(raw), split=split, target_types="segmentation",
+                                       download=True)
+                total += export_pairs(ds, pets_mask, data, f"pets_{split}",
+                                      test if split == "test" else None, N_TEST)
+            _done(data, "pets", pets_raw, keep_raw)
     if "voc" in names:
-        log("Pascal VOC 2012: download (~2 GB the first time) and export...")
-        try:
-            ds = tvd.VOCSegmentation(str(raw), year="2012", image_set="trainval",
-                                     download=True)
-            total += export_pairs(ds, voc_mask, data, "voc")
-        except Exception as e:  # mirror down, disk full... keep the other datasets
-            log(f"  VOC skipped ({type(e).__name__}: {e})")
+        voc_raw = [raw / "VOCdevkit", raw / "VOCtrainval_11-May-2012.tar"]
+        if _exported(data, "voc", voc_raw):
+            log("Pascal VOC 2012: already prepared")
+        elif _enough_space(raw, VOC_SPACE, "Pascal VOC 2012"):
+            log("Pascal VOC 2012: download (~2 GB the first time) and export...")
+            try:
+                ds = tvd.VOCSegmentation(str(raw), year="2012", image_set="trainval",
+                                         download=True)
+                total += export_pairs(ds, voc_mask, data, "voc")
+                _done(data, "voc", voc_raw, keep_raw)
+            except Exception as e:  # mirror down, disk full... keep the other datasets
+                log(f"  VOC skipped ({type(e).__name__}: {e})")
+                _remove(voc_raw)  # a half-extracted archive only wastes space
     n = len(list((data / "images").glob("*.jpg")))
     if n == 0:
         sys.exit("no training photos could be prepared")
@@ -338,6 +389,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="comma-separated: pets, voc (default: both)")
     p.add_argument("--root", type=Path, default=Path("data"),
                    help="where datasets are downloaded and exported")
+    p.add_argument("--keep-raw", action="store_true",
+                   help="keep the downloaded archives after export (default: delete)")
     p.add_argument("--out", type=Path, default=Path("runs") / MODEL_NAME)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--max-steps", type=int, help="stop after this many steps")
@@ -364,7 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     check_versions()
     data, test = args.root / "photos", args.root / "heldout"
-    n = prepare_data(args.datasets, args.root / "raw", data, test)
+    n = prepare_data(args.datasets, args.root / "raw", data, test, args.keep_raw)
     trainer = train(args, data, n)
     finalize(args, trainer, test)
     return 0
