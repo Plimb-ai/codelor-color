@@ -52,7 +52,7 @@ def test_v4_bn_is_fusable(single_thread) -> None:
 
 
 def test_presets_listed() -> None:
-    assert {"v2", "v3", "v4"} <= set(PRESETS)
+    assert {"v2", "v3", "v4", "v5"} <= set(PRESETS)
 
 
 def test_guided_filter_keeps_constant_and_follows_edges() -> None:
@@ -120,3 +120,27 @@ def test_deep_tied_model_cycles_shared_blocks() -> None:
     assert [model._get(i)[0] is model.blocks[i % 2] for i in range(7)] == [True] * 7
     with torch.no_grad():
         assert model(torch.rand(1, 3, 32, 32), torch.rand(1, 3)).shape == (1, 1, 32, 32)
+
+
+@pytest.mark.parametrize("task", ["color", "background"])
+@pytest.mark.parametrize("size", [(48, 80), (70, 90), (33, 41)])
+def test_v5_quarter_head_any_size(task: str, size: tuple[int, int], tmp_path: Path) -> None:
+    model = build_model(task, preset="v5", **SMALL).eval()
+    assert model.head == "quarter" and model.decoder.head_stride == 4
+    with torch.no_grad():
+        out = model(torch.rand(1, 3, *size), torch.rand(1, 3))
+    assert out.shape == (1, 1, *size)
+    save_pretrained(model, tmp_path)
+    assert load_from_pretrained(tmp_path).config() == model.config()
+
+
+def test_v4_preset_unchanged() -> None:
+    """Models trained with 2.4.0's default preset must keep loading."""
+    assert PRESETS["v4"]["head"] == "light"
+
+
+def test_trainer_defaults_to_v5(tmp_path: Path) -> None:
+    cfg = TrainConfig(task="color", out_dir=str(tmp_path / "r"), max_steps=1, batch_size=2,
+                      img_size=32, num_threads=1, num_workers=0, device="cpu",
+                      val_split=0.0, synthetic_length=2, model=dict(SMALL), resume=False)
+    assert Trainer(cfg, log=lambda _m: None).model.head == "quarter"

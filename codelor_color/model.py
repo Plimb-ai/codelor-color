@@ -21,7 +21,10 @@ Architecture presets (see :data:`PRESETS`):
   GroupNorm (stable with the tiny batches used on phones) and an extra
   chroma-distance guide channel. Needs new weights (train or fine-tune).
 * ``"v4"`` -- ``"v3"`` with BatchNorm instead of GroupNorm (more accurate in
-  the ablation; recommended unless training with very small batches).
+  the ablation).
+* ``"v5"`` -- ``"v4"`` with the last decoder stage at 1/4 resolution
+  (``head="quarter"``): same accuracy in the benchmark, ~20% faster
+  inference. Recommended, default for new models.
 """
 
 from __future__ import annotations
@@ -110,6 +113,17 @@ PRESETS: dict[str, dict[str, Any]] = {
         "norm": "bn",
         "chroma_guide": True,
         "head": "light",
+    },
+    # v4 with the last decoder stage at 1/4 instead of 1/2 resolution: the
+    # benchmark showed no accuracy loss (the full-resolution refinement keeps
+    # the edges) and it removes most of the remaining decoder cost.
+    "v5": {
+        "cond_mode": "film",
+        "pos_mode": "none",
+        "pos_grid": None,
+        "norm": "bn",
+        "chroma_guide": True,
+        "head": "quarter",
     },
 }
 
@@ -428,7 +442,9 @@ class GatedDecoder(nn.Module):
     is dropped since there is no target color. ``chroma_guide=True`` (preset
     ``"v3"``) adds a :func:`chroma_distance` channel.
 
-    ``head="light"`` (preset ``"v3"``) runs that last stage at half resolution and
+    ``head="light"`` (presets ``"v3"``/``"v4"``) runs that last stage at half
+    resolution (``"quarter"``, preset ``"v5"``: at 1/4 resolution, on the
+    ``f4`` grid) and
     adds a tiny full-resolution refinement (8 channels) driven by the same
     guides. The full-resolution stage is memory-bound and is the most expensive
     part of the original model on CPU; this removes most of its cost while
@@ -537,8 +553,9 @@ class CodelorColor(nn.Module):
             used by ``pos_mode="interp"`` (e.g. ``(10, 10)`` for 160x160 training).
         norm: ``"bn"`` (BatchNorm, original) or ``"gn"`` (GroupNorm).
         chroma_guide: add a CbCr chroma-distance channel to the decoder.
-        head: ``"conv"`` (original full-resolution head) or ``"light"`` (head at
-            half resolution + small full-resolution refinement, much cheaper).
+        head: ``"conv"`` (original full-resolution head), ``"light"`` (head at
+            half resolution + small full-resolution refinement, much cheaper) or
+            ``"quarter"`` (same at 1/4 resolution, cheaper still).
 
     The defaults reproduce the original architecture exactly (preset ``"v2"``).
     The model returns ``(B, 1, H, W)`` logits, or ``((B, 1, H, W), (B, 1, h4, w4))``
@@ -864,7 +881,7 @@ MODEL_CLASSES: dict[str, type[CodelorColor]] = {
 def build_model(task: str = DEFAULT_TASK, preset: str | None = None, **hyperparams: Any) -> CodelorColor:
     """Instantiate the model for ``task`` (``"color"`` or ``"background"``).
 
-    ``preset`` (``"v2"``, ``"v3"`` or ``"v4"``, see :data:`PRESETS`) fills the
+    ``preset`` (``"v2"``, ``"v3"``, ``"v4"`` or ``"v5"``, see :data:`PRESETS`) fills the
     architecture options; explicit keyword arguments override it.
 
     Example::

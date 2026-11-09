@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## [2.5.0] - 2026-11-09
+
+Nothing removed; `plimb/codelor-color-1.2` (v2), v3 and v4 checkpoints load
+unchanged (1.2 re-checked: 100% identical masks).
+
+### Added
+
+- **Preset `v5`** (new default for models trained from scratch): v4 with the
+  last decoder stage at 1/4 resolution (`head="quarter"`). Same accuracy as v4
+  in the benchmark (README), ~20% faster inference at 320-512 px and 5-16%
+  faster training steps.
+- CLI: `--preset v5`.
+
+### Fixed
+
+- Weight tying with `depth > 2 * tied_after` (e.g. `depth=12, tied_after=4`)
+  raised `IndexError`; shared blocks are now reused cyclically. Unchanged for
+  `depth <= 2 * tied_after`, which covers every existing checkpoint.
+
 ## [2.4.0] - 2026-11-09
 
 Nothing removed; `plimb/codelor-color-1.2` (v2) and v3 checkpoints from 2.3.0
