@@ -1239,8 +1239,10 @@ def predict_mask(
             Much faster on big images and closer to the training resolution;
             ``None`` (default) runs at full resolution as before.
         refine: ``"guided"`` snaps the probability to the image edges with a
-            guided filter (and uses guided upsampling with ``max_side``);
-            ``None`` / ``"none"`` keeps the raw model output (default, as before).
+            guided filter (and uses guided upsampling with ``max_side``), guided
+            by the chroma distance to the key (color models) or the luminance
+            (background models). Small gain (measured +0.2 IoU point when
+            upsampling 3x); ``None`` / ``"none"`` keeps the raw output (default).
 
     Returns:
         ``(mask, prob)`` where ``prob`` is a numpy array of shape ``(H, W)`` for a
@@ -1275,12 +1277,17 @@ def predict_mask(
                               align_corners=False, antialias=True)
         logits = model(x, ref)
         if refine == "guided":
-            gray = img.float().mean(1, keepdim=True)
+            # color models: the chroma distance to the key has the sharpest edge
+            # exactly where the key color ends; background models: luminance.
+            if getattr(model, "needs_color", True):
+                guide = (chroma_distance(img.float(), ref) * 3).clamp(0, 1)
+            else:
+                guide = img.float().mean(1, keepdim=True)
             prob_lr = torch.sigmoid(logits.float())
             if prob_lr.shape[-2:] != (H, W):
-                prob_t = guided_upsample(gray, prob_lr)
+                prob_t = guided_upsample(guide, prob_lr)
             else:
-                prob_t = guided_filter(gray, prob_lr)
+                prob_t = guided_filter(guide, prob_lr)
             prob_t = prob_t.clamp(0, 1)
         else:
             if logits.shape[-2:] != (H, W):

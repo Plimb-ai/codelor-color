@@ -237,13 +237,36 @@ def _random_texture(size: int, gen: torch.Generator) -> Tensor:
     return tex.clamp(0, 1)
 
 
-def _random_shapes_mask(size: int, gen: torch.Generator, n_max: int = 3) -> Tensor:
-    """Union of random ellipses -> ``(1, H, W)`` soft subject mask."""
+def _detail_texture(size: int, gen: torch.Generator) -> Tensor:
+    """In-focus texture: smooth colors + fine detail (noise and stripes), like a sharp subject."""
+    base = _random_texture(size, gen)
+    fine = torch.rand(1, 1, max(2, size // 3), max(2, size // 3), generator=gen)
+    fine = F.interpolate(fine, size=(size, size), mode="bilinear", align_corners=False)[0]
+    ys = torch.linspace(0, 1, size).view(1, size, 1)
+    freq, phase = 6 + 14 * float(torch.rand(1, generator=gen)), float(torch.rand(1, generator=gen))
+    stripes = 0.5 + 0.5 * torch.sin(2 * math.pi * (ys * freq + phase))
+    return (base + 0.35 * (fine - 0.5) + 0.15 * (stripes - 0.5)).clamp(0, 1)
+
+
+def _blur(x: Tensor, k: int) -> Tensor:
+    """Box blur of a ``(C, H, W)`` tensor (``k`` odd)."""
+    return F.avg_pool2d(x[None], k, stride=1, padding=k // 2, count_include_pad=False)[0]
+
+
+def _random_shapes_mask(size: int, gen: torch.Generator, n_max: int = 3,
+                        center_bias: float = 0.0) -> Tensor:
+    """Union of random ellipses -> ``(1, H, W)`` soft subject mask.
+
+    ``center_bias`` in ``[0, 1)`` pulls the ellipse centers toward the image
+    center (photos are usually framed on the subject).
+    """
     ys, xs = torch.meshgrid(torch.linspace(0, 1, size), torch.linspace(0, 1, size), indexing="ij")
     mask = torch.zeros(size, size)
     n = int(torch.randint(1, n_max + 1, (1,), generator=gen))
     for _ in range(n):
         cx, cy, rx, ry = torch.rand(4, generator=gen).tolist()
+        cx = 0.5 + (cx - 0.5) * (1 - center_bias)
+        cy = 0.5 + (cy - 0.5) * (1 - center_bias)
         rx, ry = 0.1 + 0.3 * rx, 0.1 + 0.3 * ry
         d = ((xs - cx) / rx) ** 2 + ((ys - cy) / ry) ** 2
         mask = torch.maximum(mask, torch.sigmoid((1 - d) * 12))
@@ -254,7 +277,9 @@ class SyntheticDataset(Dataset[Sample]):
     """Procedurally generated samples, no files and no Pillow needed.
 
     * ``"color"``: subjects over a solid (slightly noisy) key color.
-    * ``"background"``: subjects over random textured backgrounds.
+    * ``"background"``: framed, in-focus, shaded subjects (fine texture, sharp
+      edges, soft drop shadow) over an out-of-focus, lower-contrast background:
+      the photographic cues a background-removal model learns to use.
 
     ``hard=True`` makes it closer to real footage: uneven lighting and shadows
     on the key color, subjects tinted toward the key color, color spill on the
@@ -293,11 +318,22 @@ class SyntheticDataset(Dataset[Sample]):
                 fg = fg * (1 - tint) + ref.view(3, 1, 1) * tint
         else:
             ref = torch.tensor(DEFAULT_REF_RGB)
-            bg = _random_texture(s, gen)
+            keep = _random_shapes_mask(s, gen, n_max=2, center_bias=0.5)
+            # in-focus subject with 3D-like shading
+            shade = 0.7 + 0.45 * _blur(keep, max(3, (s // 6) | 1))
+            fg = (_detail_texture(s, gen) * shade).clamp(0, 1)
+            # out-of-focus, lower-contrast background
+            bg = _detail_texture(s, gen)
             if self.hard:
-                # distractor objects that belong to the background
+                # distractor objects that belong to the background (also out of focus)
                 distract = _random_shapes_mask(s, gen, n_max=2) * (1 - keep)
-                bg = bg * (1 - distract) + _random_texture(s, gen) * distract
+                bg = bg * (1 - distract) + _detail_texture(s, gen) * distract
+            k = max(3, (s // 12) | 1)
+            bg = _blur(bg, k)
+            bg = 0.5 + (bg - 0.5) * (0.6 + 0.2 * float(torch.rand(1, generator=gen)))
+            # soft drop shadow of the subject on the background
+            shadow = _blur(torch.roll(keep, shifts=(s // 20, s // 20), dims=(1, 2)), k)
+            bg = bg * (1 - 0.35 * shadow)
         img = fg * keep + bg * (1 - keep)
         if self.hard and self.task == "color":
             # key-color spill on the semi-transparent subject edges
