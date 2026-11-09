@@ -643,7 +643,8 @@ class CodelorColor(nn.Module):
         return c if self.cond_mode == "film" else c.unsqueeze(1)
 
     def _get(self, i: int) -> tuple[Block, nn.Module]:
-        idx = i - self.tied_after if self.tied_after > 0 and i >= self.tied_after else i
+        # cycle through the shared blocks; same as ``i - tied_after`` when depth <= 2 * tied_after
+        idx = i % self.tied_after if self.tied_after > 0 and i >= self.tied_after else i
         cond = self.color_xattn if self.color_xattn is not None else self.color_film
         assert cond is not None
         return cast(Block, self.blocks[idx]), cast(nn.Module, cond[idx])

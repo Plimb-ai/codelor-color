@@ -112,3 +112,11 @@ def test_trainer_multiscale_auto(tmp_path: Path) -> None:
     assert trainer.step == 2
     off = Trainer(TrainConfig(preset="v4", multiscale=False, **base), log=lambda _m: None)
     assert not off.multiscale
+
+
+def test_deep_tied_model_cycles_shared_blocks() -> None:
+    model = build_model("color", preset="v4", dim=32, depth=7, heads=4, tied_after=2).eval()
+    assert len(model.blocks) == 2
+    assert [model._get(i)[0] is model.blocks[i % 2] for i in range(7)] == [True] * 7
+    with torch.no_grad():
+        assert model(torch.rand(1, 3, 32, 32), torch.rand(1, 3)).shape == (1, 1, 32, 32)
