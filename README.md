@@ -119,7 +119,10 @@ continues from it (`--no-resume` to start over). The result is exported to
 Training extras: weight EMA (exported by default, `--no-ema`), BatchNorm
 statistics frozen when fine-tuning with small batches, random crop / flip /
 brightness-contrast augmentation, in-RAM image cache (fast epochs with 0
-workers), L1 alpha loss for soft edges. New models default to `--preset v3`;
+workers), L1 alpha loss for soft edges, extra loss weight on mask borders
+(`--edge-weight`), random 0.75-1.25x multi-scale batches for
+resolution-independent models (+1.9 IoU points at an unseen resolution in the
+benchmark), and `--synthetic-hard` data. New models default to `--preset v4`;
 `--init-from` keeps the checkpoint's architecture unless `--preset` is given.
 
 From Python:
@@ -168,25 +171,57 @@ installed, weights are saved to `model.pt` and `load_from_pretrained` reads it.
   prototype tokens and the decoder drops the color-similarity channel.
 - Optional gradient checkpointing (`model.set_grad_checkpointing(True)`) to train with less RAM.
 
-### Presets: `v2` (original) and `v3` (improved)
+### Presets: `v2` (original), `v3`, `v4` (recommended)
 
 `CodelorColor()` with default arguments is **exactly** the original
 architecture (`plimb/codelor-color-1.2` loads and gives the same masks).
-The `v3` preset fixes its structural weaknesses; it needs new weights
-(train from scratch, or `--init-from` a v2 checkpoint with `--preset v3` to
-reuse the stem and Transformer weights):
+`v3` and `v4` fix its structural weaknesses; they need new weights (train from
+scratch, or `--init-from` a v2 checkpoint with `--preset v4` to reuse the stem
+and Transformer weights). New models default to **`v4`**.
 
-| | `v2` (default, compatible) | `v3` |
-|---|---|---|
-| Color conditioning | cross-attention to **one** token (the softmax is always 1, so it is just a constant bias) | FiLM scale + shift in every block |
-| Positions | learned table indexed by flat token index (wrong when the resolution or aspect ratio changes, disabled above `max_tokens`) | RoPE only: any resolution |
-| Normalization | BatchNorm (noisy with batch 2 on a phone) | GroupNorm (batch-size independent) |
-| Decoder guides | RGB cosine to the key color | + CbCr chroma distance (ignores shadows) |
-| Full-resolution head | two 3x3 convs on 69 channels per pixel (memory bound, most of the CPU time) | half-resolution head + 8-channel full-resolution refinement |
-| Background model | 4 constant learned tokens | FiLM from a global context vector of the image |
+| | `v2` (default class args, compatible) | `v3` (2.3.0) | `v4` (recommended) |
+|---|---|---|---|
+| Color conditioning | cross-attention to **one** token (the softmax is always 1: a constant bias) | FiLM | FiLM |
+| Positions | learned table, flat index (wrong at other resolutions / aspect ratios) | RoPE only | RoPE only |
+| Normalization | BatchNorm | GroupNorm | BatchNorm (foldable at inference) |
+| Decoder guides | RGB cosine to the key | + CbCr chroma distance | + CbCr chroma distance |
+| Full-resolution head | two 3x3 convs on 69 channels (memory bound) | half-res head + 8-ch full-res refinement | same as v3 |
+| Background model | 4 constant learned tokens | FiLM from image context | FiLM from image context |
 
     from codelor_color import build_model
-    model = build_model("color", preset="v3")        # or "background"
+    model = build_model("color", preset="v4")        # or "background"
+
+#### How v4 was chosen (benchmark)
+
+All runs: 250 steps, 96 px, CPU, `--synthetic-hard` data (uneven lighting,
+spill and greenish subjects for color; in-focus subjects over blurred
+backgrounds with distractors for background removal). IoU of the removed
+region at the training resolution / at 160x128, and mean alpha error (L1):
+
+| Color | IoU 96 | IoU 160x128 | alpha L1 | train ms/step |
+|---|---|---|---|---|
+| v2 | **0.969** | 0.970 | 0.048 | 164 |
+| v3 | 0.965 | 0.959 | 0.031 | 106 |
+| **v4** | 0.968 | **0.971** | **0.029** | 124 |
+
+| Background | batch | IoU 96 | IoU 160x128 | alpha L1 | train ms/step |
+|---|---|---|---|---|---|
+| v2 | 8 | **0.966** | 0.952 | 0.078 | 266 |
+| v3 | 8 | 0.949 | 0.945 | 0.051 | 124 |
+| **v4** | 8 | 0.964 | **0.953** | **0.033** | 140 |
+| v2 | 2 x 4 (Termux) | **0.967** | 0.955 | 0.081 | 253 |
+| v3 | 2 x 4 (Termux) | 0.950 | 0.954 | 0.050 | 198 |
+| **v4** | 2 x 4 (Termux) | 0.965 | **0.958** | **0.035** | 205 |
+
+Ablation on background removal, starting from v2 and changing one thing:
+GroupNorm 0.957 (the component that made v3 lose accuracy, even with batch 2),
+light head 0.961 but alpha L1 0.078 -> 0.036, FiLM 0.963 but 0.952 -> 0.966 at
+160x128, RoPE-only 0.968. A deeper ConvNeXt stem and a global color context
+were also tried and brought nothing, so they are not included.
+
+So v4 matches v2's IoU, gives a 1.6-2.4x more accurate alpha (soft edges),
+works at any resolution, and is ~2x faster. Synthetic data is only a proxy:
+compare on your own images before switching a production model.
 
 For v2 models used at another resolution than their training one,
 `model.set_pos_grid((10, 10))` (grid of a 160x160 training) interpolates the
@@ -209,28 +244,25 @@ Same weights as `codelor-color-1.2`, 4 CPU threads:
 | 320x320 | 102 ms | 61 ms | 60 ms |
 | 512x512 | 252 ms | 203 ms | 170 ms |
 
-A `v3` model of the same size (1.38 M parameters) runs 320x320 in ~40 ms
-and 512x512 in ~90 ms on the same machine.
+Inference speed of new models (random weights, `optimize_for_inference`, 4 threads):
 
-Quality check, v2 vs v3 trained the same way (250 steps on the built-in
-synthetic data, 96 px, CPU). IoU of the removed region at 96 px / 160x128:
+| Model | 160x160 | 320x320 | 512x512 |
+|---|---|---|---|
+| v2 color | 27 ms | 93 ms | 254 ms |
+| v3 color | 18 ms | 53 ms | 135 ms |
+| **v4 color** | 16 ms | 46 ms | 133 ms |
 
-| Task | Batch | v2 | v3 | Training speed v2 -> v3 |
-|---|---|---|---|---|
-| color | 2 x 4 (Termux) | 0.976 / 0.971 | 0.975 / 0.971 | 259 -> 227 ms/step |
-| color | 8 | 0.976 / 0.975 | 0.975 / 0.971 | 215 -> 107 ms/step |
-| background | 2 x 4 (Termux) | 0.683 / 0.678 | 0.696 / 0.667 | 227 -> 161 ms/step |
-| background | 8 | 0.664 / 0.668 | 0.696 / 0.667 | 153 -> 107 ms/step |
-
-So on this benchmark v3 matches v2 (slightly better for background removal at
-the training resolution) while being up to 2x faster to train and to run.
-Synthetic data is easy: compare both on your own images before switching.
+Edge refinement: `predict_mask(..., refine="guided")` / `predict --refine guided`
+applies a guided filter (chroma-distance guide for color models, luminance for
+background models), also as edge-aware upsampling with `max_side`. It works
+with any model including `codelor-color-1.2`, but the measured gain is small
+(+0.2 IoU point when upsampling 3x), so it is off by default.
 
 Notes:
 
 - The learned positional embedding table holds `max_tokens` tokens (default 1024).
   Larger inputs still run, but raise a `RuntimeWarning` because the positional
-  embeddings are skipped beyond that capacity (use `set_pos_grid`, or `v3`).
+  embeddings are skipped beyond that capacity (use `set_pos_grid`, or `v3`/`v4`).
 - `predict_mask` and `remove_green` switch the model to eval mode and run under
   `torch.inference_mode()`.
 

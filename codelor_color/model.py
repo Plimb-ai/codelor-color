@@ -13,13 +13,15 @@ Two tasks share the same backbone (see :data:`TASKS`):
 Both predict the probability of each pixel being *removed*, so the same
 inference (:func:`predict_mask`) and training code applies to both.
 
-Two architecture presets (see :data:`PRESETS`):
+Architecture presets (see :data:`PRESETS`):
 
 * ``"v2"`` (default) -- the original architecture, bit-compatible with every
   published checkpoint (``plimb/codelor-color-1.2``...).
 * ``"v3"`` -- FiLM color conditioning, RoPE-only positions (any resolution),
   GroupNorm (stable with the tiny batches used on phones) and an extra
   chroma-distance guide channel. Needs new weights (train or fine-tune).
+* ``"v4"`` -- ``"v3"`` with BatchNorm instead of GroupNorm (more accurate in
+  the ablation; recommended unless training with very small batches).
 """
 
 from __future__ import annotations
@@ -96,6 +98,16 @@ PRESETS: dict[str, dict[str, Any]] = {
         "pos_mode": "none",
         "pos_grid": None,
         "norm": "gn",
+        "chroma_guide": True,
+        "head": "light",
+    },
+    # v3 without GroupNorm: the ablation (see README) showed GroupNorm was the
+    # component costing accuracy; FiLM + RoPE-only + light head are kept.
+    "v4": {
+        "cond_mode": "film",
+        "pos_mode": "none",
+        "pos_grid": None,
+        "norm": "bn",
         "chroma_guide": True,
         "head": "light",
     },
@@ -848,7 +860,7 @@ MODEL_CLASSES: dict[str, type[CodelorColor]] = {
 def build_model(task: str = DEFAULT_TASK, preset: str | None = None, **hyperparams: Any) -> CodelorColor:
     """Instantiate the model for ``task`` (``"color"`` or ``"background"``).
 
-    ``preset`` (``"v2"`` or ``"v3"``, see :data:`PRESETS`) fills the
+    ``preset`` (``"v2"``, ``"v3"`` or ``"v4"``, see :data:`PRESETS`) fills the
     architecture options; explicit keyword arguments override it.
 
     Example::
@@ -1097,6 +1109,50 @@ def _sync_model_device(model: nn.Module, device: torch.device) -> None:
         model.to(device)
 
 
+def _box(x: Tensor, r: int) -> Tensor:
+    return F.avg_pool2d(x, 2 * r + 1, stride=1, padding=r, count_include_pad=False)
+
+
+def guided_filter(guide: Tensor, src: Tensor, radius: int = 2, eps: float = 1e-3) -> Tensor:
+    """Edge-preserving guided filter (He et al.): smooths ``src`` along ``guide``'s edges.
+
+    ``guide`` and ``src`` are ``(B, 1, H, W)``. Applied to an alpha map with the
+    image luminance as guide, it snaps soft or blocky mask borders to the real
+    image edges. No parameters, works with any model (including ``codelor-color-1.2``).
+    """
+    mean_i, mean_p = _box(guide, radius), _box(src, radius)
+    cov = _box(guide * src, radius) - mean_i * mean_p
+    var = _box(guide * guide, radius) - mean_i * mean_i
+    a = cov / (var + eps)
+    b = mean_p - a * mean_i
+    return _box(a, radius) * guide + _box(b, radius)
+
+
+def guided_upsample(
+    guide_hr: Tensor, src_lr: Tensor, radius: int = 2, eps: float = 1e-3
+) -> Tensor:
+    """Fast guided filter upsampling: low-res alpha -> full-res alpha that follows image edges.
+
+    The linear coefficients are fitted at low resolution and applied to the
+    full-resolution ``guide_hr`` (``(B, 1, H, W)``), so running the model at a
+    small ``max_side`` still gives sharp full-resolution borders.
+    """
+    guide_lr = F.interpolate(guide_hr, size=src_lr.shape[-2:], mode="area")
+    mean_i, mean_p = _box(guide_lr, radius), _box(src_lr, radius)
+    cov = _box(guide_lr * src_lr, radius) - mean_i * mean_p
+    var = _box(guide_lr * guide_lr, radius) - mean_i * mean_i
+    a = cov / (var + eps)
+    b = mean_p - a * mean_i
+    size = guide_hr.shape[-2:]
+    a = F.interpolate(_box(a, radius), size=size, mode="bilinear", align_corners=False)
+    b = F.interpolate(_box(b, radius), size=size, mode="bilinear", align_corners=False)
+    return a * guide_hr + b
+
+
+#: Accepted values of the ``refine`` argument of :func:`predict_mask`.
+REFINE_MODES: tuple[str, ...] = ("none", "guided")
+
+
 def _fit_size(h: int, w: int, max_side: int) -> tuple[int, int]:
     """Scale ``(h, w)`` so the longest side is ``max_side``, rounded to multiples of 16."""
     scale = max_side / max(h, w)
@@ -1110,6 +1166,7 @@ def predict_mask(
     threshold: float = 0.5,
     device: str | torch.device = "cpu",
     max_side: int | None = None,
+    refine: str | None = None,
 ) -> tuple[Any, Any]:
     """Compute a foreground mask for an image.
 
@@ -1123,6 +1180,11 @@ def predict_mask(
             (longest side = ``max_side``) and upsample the probability back.
             Much faster on big images and closer to the training resolution;
             ``None`` (default) runs at full resolution as before.
+        refine: ``"guided"`` snaps the probability to the image edges with a
+            guided filter (and uses guided upsampling with ``max_side``), guided
+            by the chroma distance to the key (color models) or the luminance
+            (background models). Small gain (measured +0.2 IoU point when
+            upsampling 3x); ``None`` / ``"none"`` keeps the raw output (default).
 
     Returns:
         ``(mask, prob)`` where ``prob`` is a numpy array of shape ``(H, W)`` for a
@@ -1137,6 +1199,9 @@ def predict_mask(
         raise ValueError(f"color_rgb must contain 3 values, got {len(color_rgb)}")
     if max_side is not None and max_side < 16:
         raise ValueError(f"max_side must be >= 16, got {max_side}")
+    refine = refine or "none"
+    if refine not in REFINE_MODES:
+        raise ValueError(f"refine must be one of {REFINE_MODES}, got {refine!r}")
 
     device = torch.device(device)
     img = img.to(device)
@@ -1153,9 +1218,24 @@ def predict_mask(
             x = F.interpolate(img, size=_fit_size(H, W, max_side), mode="bilinear",
                               align_corners=False, antialias=True)
         logits = model(x, ref)
-        if logits.shape[-2:] != (H, W):
-            logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
-        prob_t = torch.sigmoid(logits)
+        if refine == "guided":
+            # color models: the chroma distance to the key has the sharpest edge
+            # exactly where the key color ends; background models: luminance.
+            if getattr(model, "needs_color", True):
+                guide = (chroma_distance(img.float(), ref) * 3).clamp(0, 1)
+            else:
+                guide = img.float().mean(1, keepdim=True)
+            prob_lr = torch.sigmoid(logits.float())
+            if prob_lr.shape[-2:] != (H, W):
+                prob_t = guided_upsample(guide, prob_lr)
+            else:
+                prob_t = guided_filter(guide, prob_lr)
+            prob_t = prob_t.clamp(0, 1)
+        else:
+            if logits.shape[-2:] != (H, W):
+                logits = F.interpolate(logits, size=(H, W), mode="bilinear",
+                                       align_corners=False)
+            prob_t = torch.sigmoid(logits)
     prob = prob_t[:, 0].float().cpu().numpy()
     if squeezed:
         prob = prob[0]
@@ -1199,6 +1279,7 @@ def remove_green(
     device: str | torch.device = "cpu",
     max_side: int | None = None,
     despill_strength: float = 0.0,
+    refine: str | None = None,
 ) -> Tensor:
     """Return an RGBA tensor where the alpha channel is ``1 - P(foreground)``.
 
@@ -1211,12 +1292,13 @@ def remove_green(
         max_side: see :func:`predict_mask`.
         despill_strength: ``> 0`` applies :func:`despill` to the RGB channels
             (only meaningful for color models; ``0`` = unchanged, as before).
+        refine: see :func:`predict_mask` (``"guided"`` for edge-aligned alpha).
 
     Returns:
         ``(4, H, W)`` or ``(B, 4, H, W)`` float tensor on CPU, with the same dtype
         as the input image.
     """
-    _, prob = predict_mask(model, image_tensor, color_rgb, threshold, device, max_side)
+    _, prob = predict_mask(model, image_tensor, color_rgb, threshold, device, max_side, refine)
     alpha = torch.from_numpy((1.0 - prob.astype("float32")).clip(0, 1))
 
     img = image_tensor.detach()
@@ -1238,6 +1320,7 @@ def remove_background(
     device: str | torch.device = "cpu",
     color_rgb: Sequence[float] | None = None,
     max_side: int | None = None,
+    refine: str | None = None,
 ) -> Tensor:
     """Return an RGBA tensor whose alpha is ``1 - P(removed)``.
 
@@ -1249,4 +1332,5 @@ def remove_background(
     Returns:
         ``(4, H, W)`` or ``(B, 4, H, W)`` float tensor on CPU.
     """
-    return remove_green(image_tensor, model, color_rgb, threshold, device, max_side)
+    return remove_green(image_tensor, model, color_rgb, threshold, device, max_side,
+                        refine=refine)
