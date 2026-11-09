@@ -26,6 +26,7 @@ Then::
     python train_codelor_color_bg.py --epochs 3           # shorter
     python train_codelor_color_bg.py --datasets pets      # one dataset only
     python train_codelor_color_bg.py --push-to plimb/codelor-color-bg-1.2
+    python train_codelor_color_bg.py --export-to /content/drive/MyDrive/export  # Colab + Drive
 
 Interrupting is safe (Ctrl+C, or Termux killed): run the same command again
 and training resumes from the last checkpoint. The finished model is written
@@ -374,7 +375,11 @@ def finalize(args: argparse.Namespace, trainer, test: Path) -> Path:
                         step=trainer.step, img_size=trainer.cfg.img_size,
                         heldout_iou=score))
     (dst / "README.md").write_text(model_card(args, trainer, score))
+    single = export_safetensors(model, dst)
     log(f"Model ready: {dst}")
+    log(f"Single-file weights: {single}")
+    if args.export_to:
+        export_folder(dst, single, Path(args.export_to))
     if args.push_to:
         from huggingface_hub import HfApi
 
@@ -383,6 +388,57 @@ def finalize(args: argparse.Namespace, trainer, test: Path) -> Path:
         api.upload_folder(folder_path=str(dst), repo_id=args.push_to)
         log(f"Uploaded to https://huggingface.co/{args.push_to}")
     return dst
+
+
+def export_safetensors(model, dst: Path) -> Path:
+    """Write ``<dst>/../codelor-color-bg-1.2.safetensors``: weights + config in one file.
+
+    The config (task and hyper-parameters) is stored in the safetensors
+    metadata, so the file alone is enough to rebuild the model; the folder
+    ``dst`` (config.json + model.safetensors) is what ``load_from_pretrained``
+    and Hugging Face use.
+    """
+    import json
+
+    try:
+        from safetensors.torch import save_file
+    except ImportError:
+        sys.exit("safetensors is missing: pip install safetensors "
+                 "(Termux: pkg install python-safetensors)")
+    if not (dst / "model.safetensors").is_file():  # save_pretrained fell back to model.pt
+        state = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+        save_file(state, str(dst / "model.safetensors"))
+        (dst / "model.pt").unlink(missing_ok=True)
+    out = dst.parent / f"{MODEL_NAME}.safetensors"
+    state = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+    meta = {"name": MODEL_NAME, "format": "pt",
+            "codelor_task": model.task, "hyperparameters": json.dumps(model.config())}
+    save_file(state, str(out), metadata=meta)
+    return out
+
+
+def load_single_file(path: str | Path):
+    """Rebuild a model from the single ``.safetensors`` file written above."""
+    import json
+
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    from codelor_color import build_model
+
+    with safe_open(str(path), framework="pt") as f:
+        meta = f.metadata()
+    model = build_model(meta["codelor_task"], **json.loads(meta["hyperparameters"]))
+    model.load_state_dict(load_file(str(path)))
+    return model.eval()
+
+
+def export_folder(model_dir: Path, single: Path, target: Path) -> None:
+    """Copy the model folder and the single file to ``target`` (e.g. Google Drive)."""
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(model_dir, target / model_dir.name, dirs_exist_ok=True)
+    shutil.copy2(single, target / single.name)
+    log(f"Exported to {target}")
 
 
 def model_card(args: argparse.Namespace, trainer, score: float | None) -> str:
@@ -445,6 +501,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, mps")
     p.add_argument("--from-scratch", action="store_true",
                    help=f"do not start from {BASE_MODEL}")
+    p.add_argument("--export-to", help="copy the finished model (folder + single "
+                                       ".safetensors file) to this folder, e.g. a mounted "
+                                       "Google Drive")
     p.add_argument("--push-to", help="upload the result to this Hugging Face repo "
                                      "(log in first: huggingface-cli login)")
     args = p.parse_args(argv)
