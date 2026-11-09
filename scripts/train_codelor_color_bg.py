@@ -248,6 +248,51 @@ def _available_ram() -> int | None:
     return None
 
 
+def make_safe_trainer(base):
+    """``Trainer`` that skips optimizer steps whose gradients are not finite.
+
+    One bad batch (or an fp16 overflow on GPU) can otherwise turn every weight
+    into NaN; the loss then prints ``nan`` forever and the run is lost.
+    """
+    import math
+
+    import torch
+
+    class SafeTrainer(base):
+        skipped = 0
+
+        def _optimizer_step(self) -> None:
+            self.scaler.unscale_(self.opt)
+            norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+            if not math.isfinite(float(norm)):
+                self.skipped += 1
+                if self.scaler.is_enabled():
+                    self.scaler.step(self.opt)  # skipped by the scaler, which lowers its scale
+                    self.scaler.update()
+                self.opt.zero_grad(set_to_none=True)
+                log(f"step {self.step}: non-finite gradients, update skipped "
+                    f"({self.skipped} so far)")
+                bad = [n for n, b in self.model.named_buffers()
+                       if b.is_floating_point() and not torch.isfinite(b).all()]
+                if bad and (self.out / "last.pt").is_file():
+                    log(f"  {len(bad)} statistics became NaN: reloading last checkpoint")
+                    self.load_checkpoint(self.out / "last.pt")
+                if self.skipped >= 50:
+                    raise RuntimeError("too many non-finite steps: lower --lr")
+                return
+            self.scaler.step(self.opt)
+            self.scaler.update()
+            self.opt.zero_grad(set_to_none=True)
+            self.sched.step()
+            if self.ema is not None:
+                self.ema.update(self.model)
+            self.step += 1
+            if self.step % self.cfg.save_every == 0:
+                self.save_checkpoint()
+
+    return SafeTrainer
+
+
 def train(args: argparse.Namespace, data: Path, n_photos: int):
     from codelor_color.device import recommended_profile
     from codelor_color.model import PRESETS
@@ -284,7 +329,7 @@ def train(args: argparse.Namespace, data: Path, n_photos: int):
         save_every=100,
         log_every=10,
     )
-    trainer = Trainer(cfg)
+    trainer = make_safe_trainer(Trainer)(cfg)
     trainer.fit()
     trainer.preset = preset
     return trainer
