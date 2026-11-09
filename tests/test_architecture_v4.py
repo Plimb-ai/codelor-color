@@ -23,36 +23,32 @@ SMALL = dict(dim=32, depth=2, heads=4, tied_after=1, max_tokens=64)
 def test_v3_architecture_unchanged() -> None:
     """Models trained with 2.3.0's v3 preset must keep loading."""
     model = build_model("color", preset="v3", **SMALL)
-    keys = model.state_dict().keys()
-    assert not any(k.startswith(("stem.extra", "color_ctx")) for k in keys)
-    assert "stem_depth" not in model.config() and "global_context" not in model.config()
+    assert model.norm == "gn" and model.head == "light" and model.cond_mode == "film"
 
 
 @pytest.mark.parametrize("task", ["color", "background"])
 def test_v4_forward_and_round_trip(task: str, tmp_path: Path) -> None:
     model = build_model(task, preset="v4", **SMALL).eval()
-    assert model.stem.extra4 is not None and model.stem.extra8 is not None
+    assert model.norm == "bn" and model.pos is None and model.cond_mode == "film"
     with torch.no_grad():
         out = model(torch.rand(2, 3, 48, 80), torch.rand(2, 3))
     assert out.shape == (2, 1, 48, 80)
     save_pretrained(model, tmp_path)
     loaded = load_from_pretrained(tmp_path)
     assert loaded.config() == model.config()
-    assert loaded.stem_depth == 2
 
 
-def test_v4_color_context_starts_neutral() -> None:
-    model = build_model("color", preset="v4", **SMALL).eval()
-    assert model.color_ctx is not None
-    tokens = torch.randn(2, 9, 32)
-    ref = torch.rand(2, 3)
+def test_v4_bn_is_fusable(single_thread) -> None:
+    from codelor_color.model import optimize_for_inference
+
+    model = build_model("color", preset="v4", **SMALL)
+    model.train()(torch.rand(4, 3, 48, 48), torch.rand(4, 3))
+    model.eval()
+    fast = optimize_for_inference(model)
+    img, ref = torch.rand(1, 3, 48, 48), torch.rand(1, 3)
     with torch.no_grad():
-        assert torch.equal(model._condition(ref, 2, tokens), model.color_mlp(ref))
-
-
-def test_global_context_requires_film() -> None:
-    with pytest.raises(ValueError):
-        build_model("color", **SMALL, global_context=True)
+        assert torch.allclose(fast(img, ref), model(img, ref), atol=1e-4)
+    assert not any(isinstance(m, torch.nn.BatchNorm2d) for m in fast.modules())
 
 
 def test_presets_listed() -> None:

@@ -20,8 +20,8 @@ Architecture presets (see :data:`PRESETS`):
 * ``"v3"`` -- FiLM color conditioning, RoPE-only positions (any resolution),
   GroupNorm (stable with the tiny batches used on phones) and an extra
   chroma-distance guide channel. Needs new weights (train or fine-tune).
-* ``"v4"`` -- ``"v3"`` plus ConvNeXt blocks in the stem and image-level
-  context in the color conditioning.
+* ``"v4"`` -- ``"v3"`` with BatchNorm instead of GroupNorm (more accurate in
+  the ablation; recommended unless training with very small batches).
 """
 
 from __future__ import annotations
@@ -77,8 +77,7 @@ HYPERPARAM_KEYS: tuple[str, ...] = (
 
 #: Architecture options added in 2.3 (all default to the original "v2" behaviour).
 ARCH_KEYS: tuple[str, ...] = (
-    "cond_mode", "pos_mode", "pos_grid", "norm", "chroma_guide", "head",
-    "stem_depth", "global_context",
+    "cond_mode", "pos_mode", "pos_grid", "norm", "chroma_guide", "head"
 )
 
 #: Default value of every :data:`ARCH_KEYS` option (= original architecture).
@@ -89,8 +88,6 @@ ARCH_DEFAULTS: dict[str, Any] = {
     "norm": "bn",
     "chroma_guide": False,
     "head": "conv",
-    "stem_depth": 1,
-    "global_context": False,
 }
 
 #: Named architecture presets accepted by :func:`build_model`.
@@ -103,18 +100,16 @@ PRESETS: dict[str, dict[str, Any]] = {
         "norm": "gn",
         "chroma_guide": True,
         "head": "light",
-        "stem_depth": 1,
-        "global_context": False,
     },
+    # v3 without GroupNorm: the ablation (see README) showed GroupNorm was the
+    # component costing accuracy; FiLM + RoPE-only + light head are kept.
     "v4": {
         "cond_mode": "film",
         "pos_mode": "none",
         "pos_grid": None,
-        "norm": "gn",
+        "norm": "bn",
         "chroma_guide": True,
         "head": "light",
-        "stem_depth": 2,
-        "global_context": True,
     },
 }
 
@@ -341,38 +336,15 @@ class AntiAliasDownsample(nn.Module):
         return self.act(self.bn(self.conv(self.blur(x))))
 
 
-class ConvNeXtBlock(nn.Module):
-    """ConvNeXt block: depthwise 7x7 -> norm -> 1x1 expand (4x) -> SiLU -> 1x1, scaled residual."""
-
-    def __init__(self, channels: int, norm: str = "gn", init_scale: float = 0.1) -> None:
-        super().__init__()
-        self.dw = nn.Conv2d(channels, channels, 7, padding=3, groups=channels, bias=False)
-        self.norm = make_norm2d(channels, norm)
-        self.pw1 = nn.Conv2d(channels, channels * 4, 1)
-        self.act = nn.SiLU(inplace=True)
-        self.pw2 = nn.Conv2d(channels * 4, channels, 1)
-        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1), init_scale))
-
-    def forward(self, x: Tensor) -> Tensor:
-        return x + self.gamma * self.pw2(self.act(self.pw1(self.norm(self.dw(x)))))
-
-
 class ConvNeXtStem(nn.Module):
     """Patch-embed stem producing the feature pyramid ``f4``, ``f8``, ``f16``.
 
     Channel widths come from :data:`STEM_W1` / :data:`STEM_W2`, which are shared
     with :class:`GatedDecoder`; change them together or the decoder will not load.
-
-    ``depth > 1`` (preset ``"v4"``) adds ``depth - 1`` :class:`ConvNeXtBlock`
-    at 1/4 and at 1/8 resolution: richer local features (texture, edges) for the
-    decoder skips and the Transformer, at a small cost since they run on
-    downsampled maps.
     """
 
-    def __init__(self, dim: int, norm: str = "bn", depth: int = 1) -> None:
+    def __init__(self, dim: int, norm: str = "bn") -> None:
         super().__init__()
-        if depth < 1:
-            raise ValueError(f"stem_depth must be >= 1, got {depth}")
         self.patch = nn.Sequential(
             nn.Conv2d(3, STEM_W1, kernel_size=4, stride=4, bias=False),
             make_norm2d(STEM_W1, norm),
@@ -387,21 +359,12 @@ class ConvNeXtStem(nn.Module):
         )
         self.down8 = AntiAliasDownsample(STEM_W1, STEM_W2, norm)
         self.down16 = AntiAliasDownsample(STEM_W2, dim, norm)
-        self.extra4: nn.Sequential | None = None
-        self.extra8: nn.Sequential | None = None
-        if depth > 1:
-            self.extra4 = nn.Sequential(*[ConvNeXtBlock(STEM_W1, norm) for _ in range(depth - 1)])
-            self.extra8 = nn.Sequential(*[ConvNeXtBlock(STEM_W2, norm) for _ in range(depth - 1)])
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.patch(x)
         x = x + self.block1(x)
-        if self.extra4 is not None:
-            x = self.extra4(x)
         f4 = x
         f8 = self.down8(f4)
-        if self.extra8 is not None:
-            f8 = self.extra8(f8)
         f16 = self.down16(f8)
         return f4, f8, f16
 
@@ -573,9 +536,6 @@ class CodelorColor(nn.Module):
         chroma_guide: add a CbCr chroma-distance channel to the decoder.
         head: ``"conv"`` (original full-resolution head) or ``"light"`` (head at
             half resolution + small full-resolution refinement, much cheaper).
-        stem_depth: extra ConvNeXt blocks in the stem at 1/4 and 1/8 (``1`` = none).
-        global_context: (FiLM only) add an image-level context vector to the
-            color conditioning, so the model adapts to the lighting of each image.
 
     The defaults reproduce the original architecture exactly (preset ``"v2"``).
     The model returns ``(B, 1, H, W)`` logits, or ``((B, 1, H, W), (B, 1, h4, w4))``
@@ -602,8 +562,6 @@ class CodelorColor(nn.Module):
         norm: str = "bn",
         chroma_guide: bool = False,
         head: str = "conv",
-        stem_depth: int = 1,
-        global_context: bool = False,
     ) -> None:
         super().__init__()
         if dim % heads != 0:
@@ -631,13 +589,11 @@ class CodelorColor(nn.Module):
         self.norm = norm
         self.chroma_guide = bool(chroma_guide)
         self.head = head
-        self.stem_depth = int(stem_depth)
-        self.global_context = bool(global_context)
         #: Recompute Transformer activations in backward to save RAM (training only).
         #: Not saved in ``config()``; enable it with :meth:`set_grad_checkpointing`.
         self.grad_checkpointing = False
         self._pos_warned = False
-        self.stem = ConvNeXtStem(dim, norm, self.stem_depth)
+        self.stem = ConvNeXtStem(dim, norm)
         self._build_conditioning(dim)
         self.pos: nn.Parameter | None
         if pos_mode == "none":
@@ -675,24 +631,12 @@ class CodelorColor(nn.Module):
         self.color_mlp = nn.Sequential(
             nn.Linear(3, dim), nn.SiLU(inplace=True), nn.Linear(dim, dim)
         )
-        self.color_ctx: nn.Sequential | None = None
-        if self.global_context:
-            if self.cond_mode != "film":
-                raise ValueError("global_context requires cond_mode='film'")
-            last = nn.Linear(dim, dim)
-            nn.init.zeros_(last.weight)
-            nn.init.zeros_(last.bias)
-            # image-level context (lighting, overall color cast) added to the key color
-            self.color_ctx = nn.Sequential(RMSNorm(dim), nn.Linear(dim, dim),
-                                           nn.SiLU(inplace=True), last)
 
     def _condition(self, ref_rgb: Tensor | None, batch: int, tokens: Tensor | None = None) -> Tensor:
         """Return ``(B, M, dim)`` cross-attention tokens (``"xattn"``) or a ``(B, dim)`` vector."""
         if ref_rgb is None:
             raise ValueError("CodelorColor needs ref_rgb of shape (B, 3)")
         c = cast(Tensor, self.color_mlp(ref_rgb))
-        if self.color_ctx is not None and tokens is not None:
-            c = c + cast(Tensor, self.color_ctx(tokens.mean(1)))
         return c if self.cond_mode == "film" else c.unsqueeze(1)
 
     def _get(self, i: int) -> tuple[Block, nn.Module]:
@@ -840,8 +784,6 @@ class CodelorColor(nn.Module):
             "norm": self.norm,
             "chroma_guide": self.chroma_guide,
             "head": self.head,
-            "stem_depth": self.stem_depth,
-            "global_context": self.global_context,
         }
         if arch["pos_mode"] == "interp":
             arch["pos_mode"] = "learned"  # rebuilt from pos_grid
