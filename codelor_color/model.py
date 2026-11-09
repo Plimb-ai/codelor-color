@@ -13,13 +13,15 @@ Two tasks share the same backbone (see :data:`TASKS`):
 Both predict the probability of each pixel being *removed*, so the same
 inference (:func:`predict_mask`) and training code applies to both.
 
-Two architecture presets (see :data:`PRESETS`):
+Architecture presets (see :data:`PRESETS`):
 
 * ``"v2"`` (default) -- the original architecture, bit-compatible with every
   published checkpoint (``plimb/codelor-color-1.2``...).
 * ``"v3"`` -- FiLM color conditioning, RoPE-only positions (any resolution),
   GroupNorm (stable with the tiny batches used on phones) and an extra
   chroma-distance guide channel. Needs new weights (train or fine-tune).
+* ``"v4"`` -- ``"v3"`` plus ConvNeXt blocks in the stem and image-level
+  context in the color conditioning.
 """
 
 from __future__ import annotations
@@ -75,7 +77,8 @@ HYPERPARAM_KEYS: tuple[str, ...] = (
 
 #: Architecture options added in 2.3 (all default to the original "v2" behaviour).
 ARCH_KEYS: tuple[str, ...] = (
-    "cond_mode", "pos_mode", "pos_grid", "norm", "chroma_guide", "head"
+    "cond_mode", "pos_mode", "pos_grid", "norm", "chroma_guide", "head",
+    "stem_depth", "global_context",
 )
 
 #: Default value of every :data:`ARCH_KEYS` option (= original architecture).
@@ -86,6 +89,8 @@ ARCH_DEFAULTS: dict[str, Any] = {
     "norm": "bn",
     "chroma_guide": False,
     "head": "conv",
+    "stem_depth": 1,
+    "global_context": False,
 }
 
 #: Named architecture presets accepted by :func:`build_model`.
@@ -98,6 +103,18 @@ PRESETS: dict[str, dict[str, Any]] = {
         "norm": "gn",
         "chroma_guide": True,
         "head": "light",
+        "stem_depth": 1,
+        "global_context": False,
+    },
+    "v4": {
+        "cond_mode": "film",
+        "pos_mode": "none",
+        "pos_grid": None,
+        "norm": "gn",
+        "chroma_guide": True,
+        "head": "light",
+        "stem_depth": 2,
+        "global_context": True,
     },
 }
 
@@ -324,15 +341,38 @@ class AntiAliasDownsample(nn.Module):
         return self.act(self.bn(self.conv(self.blur(x))))
 
 
+class ConvNeXtBlock(nn.Module):
+    """ConvNeXt block: depthwise 7x7 -> norm -> 1x1 expand (4x) -> SiLU -> 1x1, scaled residual."""
+
+    def __init__(self, channels: int, norm: str = "gn", init_scale: float = 0.1) -> None:
+        super().__init__()
+        self.dw = nn.Conv2d(channels, channels, 7, padding=3, groups=channels, bias=False)
+        self.norm = make_norm2d(channels, norm)
+        self.pw1 = nn.Conv2d(channels, channels * 4, 1)
+        self.act = nn.SiLU(inplace=True)
+        self.pw2 = nn.Conv2d(channels * 4, channels, 1)
+        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1), init_scale))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.gamma * self.pw2(self.act(self.pw1(self.norm(self.dw(x)))))
+
+
 class ConvNeXtStem(nn.Module):
     """Patch-embed stem producing the feature pyramid ``f4``, ``f8``, ``f16``.
 
     Channel widths come from :data:`STEM_W1` / :data:`STEM_W2`, which are shared
     with :class:`GatedDecoder`; change them together or the decoder will not load.
+
+    ``depth > 1`` (preset ``"v4"``) adds ``depth - 1`` :class:`ConvNeXtBlock`
+    at 1/4 and at 1/8 resolution: richer local features (texture, edges) for the
+    decoder skips and the Transformer, at a small cost since they run on
+    downsampled maps.
     """
 
-    def __init__(self, dim: int, norm: str = "bn") -> None:
+    def __init__(self, dim: int, norm: str = "bn", depth: int = 1) -> None:
         super().__init__()
+        if depth < 1:
+            raise ValueError(f"stem_depth must be >= 1, got {depth}")
         self.patch = nn.Sequential(
             nn.Conv2d(3, STEM_W1, kernel_size=4, stride=4, bias=False),
             make_norm2d(STEM_W1, norm),
@@ -347,12 +387,21 @@ class ConvNeXtStem(nn.Module):
         )
         self.down8 = AntiAliasDownsample(STEM_W1, STEM_W2, norm)
         self.down16 = AntiAliasDownsample(STEM_W2, dim, norm)
+        self.extra4: nn.Sequential | None = None
+        self.extra8: nn.Sequential | None = None
+        if depth > 1:
+            self.extra4 = nn.Sequential(*[ConvNeXtBlock(STEM_W1, norm) for _ in range(depth - 1)])
+            self.extra8 = nn.Sequential(*[ConvNeXtBlock(STEM_W2, norm) for _ in range(depth - 1)])
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         x = self.patch(x)
         x = x + self.block1(x)
+        if self.extra4 is not None:
+            x = self.extra4(x)
         f4 = x
         f8 = self.down8(f4)
+        if self.extra8 is not None:
+            f8 = self.extra8(f8)
         f16 = self.down16(f8)
         return f4, f8, f16
 
@@ -524,6 +573,9 @@ class CodelorColor(nn.Module):
         chroma_guide: add a CbCr chroma-distance channel to the decoder.
         head: ``"conv"`` (original full-resolution head) or ``"light"`` (head at
             half resolution + small full-resolution refinement, much cheaper).
+        stem_depth: extra ConvNeXt blocks in the stem at 1/4 and 1/8 (``1`` = none).
+        global_context: (FiLM only) add an image-level context vector to the
+            color conditioning, so the model adapts to the lighting of each image.
 
     The defaults reproduce the original architecture exactly (preset ``"v2"``).
     The model returns ``(B, 1, H, W)`` logits, or ``((B, 1, H, W), (B, 1, h4, w4))``
@@ -550,6 +602,8 @@ class CodelorColor(nn.Module):
         norm: str = "bn",
         chroma_guide: bool = False,
         head: str = "conv",
+        stem_depth: int = 1,
+        global_context: bool = False,
     ) -> None:
         super().__init__()
         if dim % heads != 0:
@@ -577,11 +631,13 @@ class CodelorColor(nn.Module):
         self.norm = norm
         self.chroma_guide = bool(chroma_guide)
         self.head = head
+        self.stem_depth = int(stem_depth)
+        self.global_context = bool(global_context)
         #: Recompute Transformer activations in backward to save RAM (training only).
         #: Not saved in ``config()``; enable it with :meth:`set_grad_checkpointing`.
         self.grad_checkpointing = False
         self._pos_warned = False
-        self.stem = ConvNeXtStem(dim, norm)
+        self.stem = ConvNeXtStem(dim, norm, self.stem_depth)
         self._build_conditioning(dim)
         self.pos: nn.Parameter | None
         if pos_mode == "none":
@@ -619,12 +675,24 @@ class CodelorColor(nn.Module):
         self.color_mlp = nn.Sequential(
             nn.Linear(3, dim), nn.SiLU(inplace=True), nn.Linear(dim, dim)
         )
+        self.color_ctx: nn.Sequential | None = None
+        if self.global_context:
+            if self.cond_mode != "film":
+                raise ValueError("global_context requires cond_mode='film'")
+            last = nn.Linear(dim, dim)
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+            # image-level context (lighting, overall color cast) added to the key color
+            self.color_ctx = nn.Sequential(RMSNorm(dim), nn.Linear(dim, dim),
+                                           nn.SiLU(inplace=True), last)
 
     def _condition(self, ref_rgb: Tensor | None, batch: int, tokens: Tensor | None = None) -> Tensor:
         """Return ``(B, M, dim)`` cross-attention tokens (``"xattn"``) or a ``(B, dim)`` vector."""
         if ref_rgb is None:
             raise ValueError("CodelorColor needs ref_rgb of shape (B, 3)")
         c = cast(Tensor, self.color_mlp(ref_rgb))
+        if self.color_ctx is not None and tokens is not None:
+            c = c + cast(Tensor, self.color_ctx(tokens.mean(1)))
         return c if self.cond_mode == "film" else c.unsqueeze(1)
 
     def _get(self, i: int) -> tuple[Block, nn.Module]:
@@ -772,6 +840,8 @@ class CodelorColor(nn.Module):
             "norm": self.norm,
             "chroma_guide": self.chroma_guide,
             "head": self.head,
+            "stem_depth": self.stem_depth,
+            "global_context": self.global_context,
         }
         if arch["pos_mode"] == "interp":
             arch["pos_mode"] = "learned"  # rebuilt from pos_grid
@@ -848,7 +918,7 @@ MODEL_CLASSES: dict[str, type[CodelorColor]] = {
 def build_model(task: str = DEFAULT_TASK, preset: str | None = None, **hyperparams: Any) -> CodelorColor:
     """Instantiate the model for ``task`` (``"color"`` or ``"background"``).
 
-    ``preset`` (``"v2"`` or ``"v3"``, see :data:`PRESETS`) fills the
+    ``preset`` (``"v2"``, ``"v3"`` or ``"v4"``, see :data:`PRESETS`) fills the
     architecture options; explicit keyword arguments override it.
 
     Example::
@@ -1097,6 +1167,50 @@ def _sync_model_device(model: nn.Module, device: torch.device) -> None:
         model.to(device)
 
 
+def _box(x: Tensor, r: int) -> Tensor:
+    return F.avg_pool2d(x, 2 * r + 1, stride=1, padding=r, count_include_pad=False)
+
+
+def guided_filter(guide: Tensor, src: Tensor, radius: int = 2, eps: float = 1e-3) -> Tensor:
+    """Edge-preserving guided filter (He et al.): smooths ``src`` along ``guide``'s edges.
+
+    ``guide`` and ``src`` are ``(B, 1, H, W)``. Applied to an alpha map with the
+    image luminance as guide, it snaps soft or blocky mask borders to the real
+    image edges. No parameters, works with any model (including ``codelor-color-1.2``).
+    """
+    mean_i, mean_p = _box(guide, radius), _box(src, radius)
+    cov = _box(guide * src, radius) - mean_i * mean_p
+    var = _box(guide * guide, radius) - mean_i * mean_i
+    a = cov / (var + eps)
+    b = mean_p - a * mean_i
+    return _box(a, radius) * guide + _box(b, radius)
+
+
+def guided_upsample(
+    guide_hr: Tensor, src_lr: Tensor, radius: int = 2, eps: float = 1e-3
+) -> Tensor:
+    """Fast guided filter upsampling: low-res alpha -> full-res alpha that follows image edges.
+
+    The linear coefficients are fitted at low resolution and applied to the
+    full-resolution ``guide_hr`` (``(B, 1, H, W)``), so running the model at a
+    small ``max_side`` still gives sharp full-resolution borders.
+    """
+    guide_lr = F.interpolate(guide_hr, size=src_lr.shape[-2:], mode="area")
+    mean_i, mean_p = _box(guide_lr, radius), _box(src_lr, radius)
+    cov = _box(guide_lr * src_lr, radius) - mean_i * mean_p
+    var = _box(guide_lr * guide_lr, radius) - mean_i * mean_i
+    a = cov / (var + eps)
+    b = mean_p - a * mean_i
+    size = guide_hr.shape[-2:]
+    a = F.interpolate(_box(a, radius), size=size, mode="bilinear", align_corners=False)
+    b = F.interpolate(_box(b, radius), size=size, mode="bilinear", align_corners=False)
+    return a * guide_hr + b
+
+
+#: Accepted values of the ``refine`` argument of :func:`predict_mask`.
+REFINE_MODES: tuple[str, ...] = ("none", "guided")
+
+
 def _fit_size(h: int, w: int, max_side: int) -> tuple[int, int]:
     """Scale ``(h, w)`` so the longest side is ``max_side``, rounded to multiples of 16."""
     scale = max_side / max(h, w)
@@ -1110,6 +1224,7 @@ def predict_mask(
     threshold: float = 0.5,
     device: str | torch.device = "cpu",
     max_side: int | None = None,
+    refine: str | None = None,
 ) -> tuple[Any, Any]:
     """Compute a foreground mask for an image.
 
@@ -1123,6 +1238,9 @@ def predict_mask(
             (longest side = ``max_side``) and upsample the probability back.
             Much faster on big images and closer to the training resolution;
             ``None`` (default) runs at full resolution as before.
+        refine: ``"guided"`` snaps the probability to the image edges with a
+            guided filter (and uses guided upsampling with ``max_side``);
+            ``None`` / ``"none"`` keeps the raw model output (default, as before).
 
     Returns:
         ``(mask, prob)`` where ``prob`` is a numpy array of shape ``(H, W)`` for a
@@ -1137,6 +1255,9 @@ def predict_mask(
         raise ValueError(f"color_rgb must contain 3 values, got {len(color_rgb)}")
     if max_side is not None and max_side < 16:
         raise ValueError(f"max_side must be >= 16, got {max_side}")
+    refine = refine or "none"
+    if refine not in REFINE_MODES:
+        raise ValueError(f"refine must be one of {REFINE_MODES}, got {refine!r}")
 
     device = torch.device(device)
     img = img.to(device)
@@ -1153,9 +1274,19 @@ def predict_mask(
             x = F.interpolate(img, size=_fit_size(H, W, max_side), mode="bilinear",
                               align_corners=False, antialias=True)
         logits = model(x, ref)
-        if logits.shape[-2:] != (H, W):
-            logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
-        prob_t = torch.sigmoid(logits)
+        if refine == "guided":
+            gray = img.float().mean(1, keepdim=True)
+            prob_lr = torch.sigmoid(logits.float())
+            if prob_lr.shape[-2:] != (H, W):
+                prob_t = guided_upsample(gray, prob_lr)
+            else:
+                prob_t = guided_filter(gray, prob_lr)
+            prob_t = prob_t.clamp(0, 1)
+        else:
+            if logits.shape[-2:] != (H, W):
+                logits = F.interpolate(logits, size=(H, W), mode="bilinear",
+                                       align_corners=False)
+            prob_t = torch.sigmoid(logits)
     prob = prob_t[:, 0].float().cpu().numpy()
     if squeezed:
         prob = prob[0]
@@ -1199,6 +1330,7 @@ def remove_green(
     device: str | torch.device = "cpu",
     max_side: int | None = None,
     despill_strength: float = 0.0,
+    refine: str | None = None,
 ) -> Tensor:
     """Return an RGBA tensor where the alpha channel is ``1 - P(foreground)``.
 
@@ -1211,12 +1343,13 @@ def remove_green(
         max_side: see :func:`predict_mask`.
         despill_strength: ``> 0`` applies :func:`despill` to the RGB channels
             (only meaningful for color models; ``0`` = unchanged, as before).
+        refine: see :func:`predict_mask` (``"guided"`` for edge-aligned alpha).
 
     Returns:
         ``(4, H, W)`` or ``(B, 4, H, W)`` float tensor on CPU, with the same dtype
         as the input image.
     """
-    _, prob = predict_mask(model, image_tensor, color_rgb, threshold, device, max_side)
+    _, prob = predict_mask(model, image_tensor, color_rgb, threshold, device, max_side, refine)
     alpha = torch.from_numpy((1.0 - prob.astype("float32")).clip(0, 1))
 
     img = image_tensor.detach()
@@ -1238,6 +1371,7 @@ def remove_background(
     device: str | torch.device = "cpu",
     color_rgb: Sequence[float] | None = None,
     max_side: int | None = None,
+    refine: str | None = None,
 ) -> Tensor:
     """Return an RGBA tensor whose alpha is ``1 - P(removed)``.
 
@@ -1249,4 +1383,5 @@ def remove_background(
     Returns:
         ``(4, H, W)`` or ``(B, 4, H, W)`` float tensor on CPU.
     """
-    return remove_green(image_tensor, model, color_rgb, threshold, device, max_side)
+    return remove_green(image_tensor, model, color_rgb, threshold, device, max_side,
+                        refine=refine)

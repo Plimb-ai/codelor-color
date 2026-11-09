@@ -75,6 +75,12 @@ def _cmd_train(args: argparse.Namespace) -> int:
         data["cache"] = False
     if args.no_augment:
         data["augment"] = False
+    if args.edge_weight is not None:
+        data["edge_weight"] = args.edge_weight
+    if args.multiscale is not None:
+        data["multiscale"] = args.multiscale == "on"
+    if args.synthetic_hard:
+        data["synthetic_hard"] = True
     model_kw = dict(data.get("model", {"dim": 128, "depth": 8, "heads": 8, "tied_after": 4}))
     for key in ("dim", "depth", "heads", "tied_after"):
         if getattr(args, key) is not None:
@@ -114,7 +120,7 @@ def _cmd_predict(args: argparse.Namespace) -> int:
             x = F.interpolate(img[None], size=(args.size, args.size), mode="bilinear",
                               align_corners=False)[0]
         alpha = remove_green(x, model, color_rgb=args.color, threshold=args.threshold,
-                             device=device, max_side=args.max_side)[3:]
+                             device=device, max_side=args.max_side, refine=args.refine)[3:]
         if alpha.shape[-2:] != (h, w):
             alpha = F.interpolate(alpha[None], size=(h, w), mode="bilinear",
                                   align_corners=False)[0]
@@ -164,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--grad-checkpointing", action="store_true", help="lower RAM, slower")
     t.add_argument("--invert-masks", action="store_true", help="masks are white = remove")
     t.add_argument("--no-resume", action="store_true", help="ignore out/last.pt")
-    t.add_argument("--preset", choices=["v2", "v3"],
+    t.add_argument("--preset", choices=["v2", "v3", "v4"],
                    help="architecture: v3 (default from scratch, faster, resolution-free) "
                         "or v2 (original). With --init-from: convert the checkpoint")
     t.add_argument("--ema-decay", type=float, help="weight EMA decay (default 0.999)")
@@ -173,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="freeze BatchNorm stats (default: on when fine-tuning with batch < 8)")
     t.add_argument("--no-cache", action="store_true", help="do not keep images in RAM")
     t.add_argument("--no-augment", action="store_true", help="disable crop/flip/jitter")
+    t.add_argument("--edge-weight", type=float, help="extra loss weight on mask borders (1.0)")
+    t.add_argument("--multiscale", choices=["on", "off"],
+                   help="random 0.75-1.25x rescale (default: on for v3/v4)")
+    t.add_argument("--synthetic-hard", action="store_true",
+                   help="harder synthetic data (shadows, spill, distractors)")
 
     p = sub.add_parser("predict", help="cut out images, writes RGBA PNGs")
     p.add_argument("inputs", nargs="+")
@@ -187,6 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--despill", type=float, default=0.0,
                    help="color models: remove key-color fringes, strength 0..1")
     p.add_argument("--int8", action="store_true", help="int8 quantized Transformer (CPU/ARM)")
+    p.add_argument("--refine", choices=["none", "guided"], default="none",
+                   help="guided: snap the alpha to the image edges (works with any model)")
     p.add_argument("--no-optimize", action="store_true", help="skip BatchNorm fusion")
     p.add_argument("--pos-grid", type=int, nargs=2, metavar=("ROWS", "COLS"),
                    help="v2 models: token grid used in training (10 10 for 160px) to "

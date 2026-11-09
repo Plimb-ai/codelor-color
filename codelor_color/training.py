@@ -256,15 +256,21 @@ class SyntheticDataset(Dataset[Sample]):
     * ``"color"``: subjects over a solid (slightly noisy) key color.
     * ``"background"``: subjects over random textured backgrounds.
 
+    ``hard=True`` makes it closer to real footage: uneven lighting and shadows
+    on the key color, subjects tinted toward the key color, color spill on the
+    subject edges, and (background task) distractor shapes in the background
+    that must *not* be kept.
+
     Good for smoke tests, benchmarking a device, or pre-training before
     fine-tuning on real data.
     """
 
     def __init__(self, task: str = "color", length: int = 256, img_size: int = 64,
-                 seed: int = 0) -> None:
+                 seed: int = 0, hard: bool = False) -> None:
         if task not in TASKS:
             raise ValueError(f"unknown task {task!r}, expected one of {TASKS}")
         self.task, self.length, self.img_size, self.seed = task, length, img_size, seed
+        self.hard = hard
 
     def __len__(self) -> int:
         return self.length
@@ -278,11 +284,26 @@ class SyntheticDataset(Dataset[Sample]):
             base = torch.tensor(DEFAULT_REF_RGB)
             ref = (base + 0.1 * (torch.rand(3, generator=gen) - 0.5)).clamp(0, 1)
             bg = ref.view(3, 1, 1) + 0.03 * torch.randn(3, s, s, generator=gen)
+            if self.hard:
+                # uneven lighting / soft shadows on the screen
+                light = 0.55 + 0.6 * _random_texture(s, gen).mean(0, keepdim=True)
+                bg = bg * light
+                # subjects partly tinted toward the key color
+                tint = 0.45 * float(torch.rand(1, generator=gen))
+                fg = fg * (1 - tint) + ref.view(3, 1, 1) * tint
         else:
             ref = torch.tensor(DEFAULT_REF_RGB)
             bg = _random_texture(s, gen)
-        img = (fg * keep + bg * (1 - keep)).clamp(0, 1)
-        return img, 1.0 - keep, ref
+            if self.hard:
+                # distractor objects that belong to the background
+                distract = _random_shapes_mask(s, gen, n_max=2) * (1 - keep)
+                bg = bg * (1 - distract) + _random_texture(s, gen) * distract
+        img = fg * keep + bg * (1 - keep)
+        if self.hard and self.task == "color":
+            # key-color spill on the semi-transparent subject edges
+            edge = (keep * (1 - keep) * 4).clamp(0, 1)
+            img = img + 0.25 * edge * (ref.view(3, 1, 1) - img)
+        return img.clamp(0, 1), 1.0 - keep, ref
 
 
 class CompositeDataset(Dataset[Sample]):
@@ -354,14 +375,29 @@ class CompositeDataset(Dataset[Sample]):
 # LOSS / METRICS
 # ============================================================
 
+def edge_map(target: Tensor, width: int = 2) -> Tensor:
+    """``1`` on a band of ``width`` pixels around the mask borders, ``0`` elsewhere."""
+    k = 2 * width + 1
+    dil = F.max_pool2d(target, k, stride=1, padding=width)
+    ero = -F.max_pool2d(-target, k, stride=1, padding=width)
+    return ((dil - ero) > 0.05).float()
+
+
 def segmentation_loss(main: Tensor, aux: Tensor, target: Tensor,
-                      aux_weight: float = 0.4, l1_weight: float = 1.0) -> Tensor:
+                      aux_weight: float = 0.4, l1_weight: float = 1.0,
+                      edge_weight: float = 0.0) -> Tensor:
     """BCE + soft Dice + L1 (alpha) on the full-res logits, plus BCE deep supervision.
 
     The L1 term on probabilities rewards accurate *soft* alpha values on edges
     (hair, motion blur, transparency), which BCE/Dice alone push to 0/1.
+    ``edge_weight > 0`` multiplies the BCE of pixels near mask borders by
+    ``1 + edge_weight``: borders are few pixels but what the eye sees.
     """
-    bce = F.binary_cross_entropy_with_logits(main, target)
+    if edge_weight > 0:
+        weight = 1.0 + edge_weight * edge_map(target)
+        bce = F.binary_cross_entropy_with_logits(main, target, weight=weight)
+    else:
+        bce = F.binary_cross_entropy_with_logits(main, target)
     prob = torch.sigmoid(main)
     inter = (prob * target).flatten(1).sum(1)
     union = prob.flatten(1).sum(1) + target.flatten(1).sum(1)
@@ -412,6 +448,7 @@ class TrainConfig:
     seed: int = 0
     invert_masks: bool = False
     synthetic_length: int = 512
+    synthetic_hard: bool = False
 
     batch_size: int | None = None
     accum_steps: int | None = None
@@ -426,6 +463,9 @@ class TrainConfig:
                                          # with a small batch (< 8); no effect on GroupNorm
     cache: bool = True                   # keep decoded images in RAM (folder dataset)
     augment: bool = True
+    edge_weight: float = 1.0             # extra BCE weight on mask borders (0 = off)
+    multiscale: bool | None = None       # random 0.75-1.25x batch rescale; None: on for
+                                         # resolution-independent models (v3/v4, pos_grid)
 
     log_every: int = 10
     save_every: int = 200                # optimizer steps between checkpoints
@@ -464,7 +504,7 @@ def build_dataset(cfg: TrainConfig, augment: bool | None = None) -> Dataset[Samp
     if cfg.foregrounds_dir:
         return CompositeDataset(cfg.foregrounds_dir, cfg.task, cfg.backgrounds_dir, size)
     logger.warning("No data_dir / foregrounds_dir given: training on synthetic data")
-    return SyntheticDataset(cfg.task, cfg.synthetic_length, size, cfg.seed)
+    return SyntheticDataset(cfg.task, cfg.synthetic_length, size, cfg.seed, cfg.synthetic_hard)
 
 
 def _atomic_save(obj: Any, path: Path) -> None:
@@ -537,6 +577,8 @@ class Trainer:
         small_batch = int(c.batch_size or 1) < 8
         self.freeze_bn = (bool(c.init_from) and small_batch) if c.freeze_bn is None else c.freeze_bn
         self.ema = ModelEMA(self.model, c.ema_decay) if c.ema_decay else None
+        self.multiscale = (self.model.pos_mode != "learned") if c.multiscale is None \
+            else c.multiscale
 
         train_ds, val_ds = self._split(dataset)
         loader_kw: dict[str, Any] = dict(
@@ -693,6 +735,18 @@ class Trainer:
         self._train_mode()
         return sum(scores) / max(1, len(scores))
 
+    @staticmethod
+    def _rescale(img: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
+        """Random 0.75x / 1x / 1.25x rescale of a batch (multiple of 16 pixels)."""
+        k = random.choice((0.75, 1.0, 1.0, 1.25))
+        if k == 1.0:
+            return img, target
+        size = [max(32, int(round(d * k / 16)) * 16) for d in img.shape[-2:]]
+        img = F.interpolate(img, size=size, mode="bilinear", align_corners=False,
+                            antialias=k < 1)
+        target = F.interpolate(target, size=size, mode="bilinear", align_corners=False)
+        return img, target
+
     def _optimizer_step(self) -> None:
         c = self.cfg
         self.scaler.unscale_(self.opt)
@@ -718,7 +772,7 @@ class Trainer:
         self.log(f"Training task={self.model.task} {self.model.extra_repr()} on {self.device} | "
                  f"batch={c.batch_size}x{accum} img={c.img_size} threads={torch.get_num_threads()} "
                  f"workers={c.num_workers} steps={self.total_steps} ema={self.ema is not None} "
-                 f"freeze_bn={self.freeze_bn}")
+                 f"freeze_bn={self.freeze_bn} multiscale={self.multiscale}")
         self._train_mode()
         amp_ctx: Callable[[], Any] = (
             (lambda: torch.autocast(self.device.type)) if self.use_amp else contextlib.nullcontext
@@ -731,9 +785,12 @@ class Trainer:
                 self.opt.zero_grad(set_to_none=True)
                 micro = 0
                 for img, target, ref in self._batches():
+                    if self.multiscale:
+                        img, target = self._rescale(img, target)
                     with amp_ctx():
                         main, aux = self.model(img, ref, return_aux=True)
-                        loss = segmentation_loss(main.float(), aux.float(), target) / accum
+                        loss = segmentation_loss(main.float(), aux.float(), target,
+                                                 edge_weight=c.edge_weight) / accum
                     self.scaler.scale(loss).backward()
                     running += float(loss.detach()) * accum
                     logged += 1
