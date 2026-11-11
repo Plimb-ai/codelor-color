@@ -2,6 +2,14 @@
 
 This repository contains the pure PyTorch architecture for Codelor Color, a lightweight Transformer designed for Chroma Key (green screen) segmentation.
 
+<p align="center">
+  <a href="https://github.com/Plimb-ai/codelor-color/blob/main/docs/architecture.mp4">
+    <img src="https://raw.githubusercontent.com/Plimb-ai/codelor-color/main/docs/architecture.gif" alt="The codelor-color architecture in 45 seconds: stem, Transformer, FiLM conditioning, gated decoder" width="300">
+  </a>
+  <br>
+  <em>The architecture in 45 seconds. <a href="https://github.com/Plimb-ai/codelor-color/blob/main/docs/architecture.mp4">Watch the full video with sound</a>.</em>
+</p>
+
 Since 2.3.0 the same backbone comes in two flavours, pick the one you need:
 
 | Task | Class | Removes | Needs a color? |
