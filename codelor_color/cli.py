@@ -170,9 +170,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--grad-checkpointing", action="store_true", help="lower RAM, slower")
     t.add_argument("--invert-masks", action="store_true", help="masks are white = remove")
     t.add_argument("--no-resume", action="store_true", help="ignore out/last.pt")
-    t.add_argument("--preset", choices=["v2", "v3", "v4"],
-                   help="architecture: v4 (default from scratch: as accurate as v2, better "
-                        "alpha, ~2x faster, any resolution), v3, or v2 (original). "
+    t.add_argument("--preset", choices=["v2", "v3", "v4", "v5"],
+                   help="architecture: v5 (default from scratch: as accurate as v2, better "
+                        "alpha, ~2.5x faster, any resolution), v4, v3, or v2 (original). "
                         "With --init-from: convert the checkpoint")
     t.add_argument("--ema-decay", type=float, help="weight EMA decay (default 0.999)")
     t.add_argument("--no-ema", action="store_true", help="export raw weights instead of EMA")
@@ -182,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--no-augment", action="store_true", help="disable crop/flip/jitter")
     t.add_argument("--edge-weight", type=float, help="extra loss weight on mask borders (1.0)")
     t.add_argument("--multiscale", choices=["on", "off"],
-                   help="random 0.75-1.25x rescale (default: on for v3/v4)")
+                   help="random 0.75-1.25x rescale (default: on for v3/v4/v5)")
     t.add_argument("--synthetic-hard", action="store_true",
                    help="harder synthetic data (shadows, spill, distractors)")
 

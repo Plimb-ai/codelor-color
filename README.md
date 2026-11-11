@@ -2,6 +2,14 @@
 
 This repository contains the pure PyTorch architecture for Codelor Color, a lightweight Transformer designed for Chroma Key (green screen) segmentation.
 
+<p align="center">
+  <a href="https://github.com/Plimb-ai/codelor-color/blob/main/docs/architecture.mp4">
+    <img src="https://raw.githubusercontent.com/Plimb-ai/codelor-color/main/docs/architecture.gif" alt="The codelor-color architecture in 45 seconds: stem, Transformer, FiLM conditioning, gated decoder" width="300">
+  </a>
+  <br>
+  <em>The architecture in 45 seconds. <a href="https://github.com/Plimb-ai/codelor-color/blob/main/docs/architecture.mp4">Watch the full video with sound</a>.</em>
+</p>
+
 Since 2.3.0 the same backbone comes in two flavours, pick the one you need:
 
 | Task | Class | Removes | Needs a color? |
@@ -122,7 +130,7 @@ brightness-contrast augmentation, in-RAM image cache (fast epochs with 0
 workers), L1 alpha loss for soft edges, extra loss weight on mask borders
 (`--edge-weight`), random 0.75-1.25x multi-scale batches for
 resolution-independent models (+1.9 IoU points at an unseen resolution in the
-benchmark), and `--synthetic-hard` data. New models default to `--preset v4`;
+benchmark), and `--synthetic-hard` data. New models default to `--preset v5`;
 `--init-from` keeps the checkpoint's architecture unless `--preset` is given.
 
 From Python:
@@ -133,6 +141,18 @@ From Python:
 All options (`--batch-size`, `--accum-steps`, `--img-size`, `--threads`,
 `--workers`, `--device`, `--grad-checkpointing`, `--dim`, ...) can also be
 put in a JSON file passed with `--config`.
+
+### Ready-made recipe: background removal on real photos
+
+`scripts/train_codelor_color_bg.py` downloads real photos with their masks
+through torchvision (Oxford-IIIT Pet, Pascal VOC 2012), fine-tunes
+`plimb/codelor-color-1.2` into a background-removal model named
+`codelor-color-bg-1.2`, scores it on held-out photos and writes sample
+cut-outs and a model card (works on Termux; resumes after an interruption):
+
+    python scripts/train_codelor_color_bg.py --update   # update codelor-color
+    python scripts/train_codelor_color_bg.py            # prepare data + train
+    python scripts/train_codelor_color_bg.py --push-to <user>/codelor-color-bg-1.2
 
 ## 📱 Training on Termux (Android)
 
@@ -171,25 +191,26 @@ installed, weights are saved to `model.pt` and `load_from_pretrained` reads it.
   prototype tokens and the decoder drops the color-similarity channel.
 - Optional gradient checkpointing (`model.set_grad_checkpointing(True)`) to train with less RAM.
 
-### Presets: `v2` (original), `v3`, `v4` (recommended)
+### Presets: `v2` (original), `v3`, `v4`, `v5` (recommended)
 
 `CodelorColor()` with default arguments is **exactly** the original
 architecture (`plimb/codelor-color-1.2` loads and gives the same masks).
-`v3` and `v4` fix its structural weaknesses; they need new weights (train from
-scratch, or `--init-from` a v2 checkpoint with `--preset v4` to reuse the stem
-and Transformer weights). New models default to **`v4`**.
+`v3`, `v4` and `v5` fix its structural weaknesses; they need new weights (train
+from scratch, or `--init-from` a v2 checkpoint with `--preset v5` to reuse the
+stem and Transformer weights). New models default to **`v5`** (since 2.5.0;
+`v4` was the default in 2.4.0, and both keep loading).
 
-| | `v2` (default class args, compatible) | `v3` (2.3.0) | `v4` (recommended) |
+| | `v2` (default class args, compatible) | `v3` (2.3.0) | `v4` (2.4.0) / `v5` (recommended) |
 |---|---|---|---|
 | Color conditioning | cross-attention to **one** token (the softmax is always 1: a constant bias) | FiLM | FiLM |
 | Positions | learned table, flat index (wrong at other resolutions / aspect ratios) | RoPE only | RoPE only |
 | Normalization | BatchNorm | GroupNorm | BatchNorm (foldable at inference) |
 | Decoder guides | RGB cosine to the key | + CbCr chroma distance | + CbCr chroma distance |
-| Full-resolution head | two 3x3 convs on 69 channels (memory bound) | half-res head + 8-ch full-res refinement | same as v3 |
+| Full-resolution head | two 3x3 convs on 69 channels (memory bound) | half-res head + 8-ch full-res refinement | v4: same as v3; v5: head at 1/4 res + same refinement |
 | Background model | 4 constant learned tokens | FiLM from image context | FiLM from image context |
 
     from codelor_color import build_model
-    model = build_model("color", preset="v4")        # or "background"
+    model = build_model("color", preset="v5")        # or "background"
 
 #### How v4 was chosen (benchmark)
 
@@ -223,6 +244,28 @@ So v4 matches v2's IoU, gives a 1.6-2.4x more accurate alpha (soft edges),
 works at any resolution, and is ~2x faster. Synthetic data is only a proxy:
 compare on your own images before switching a production model.
 
+#### v5: the last decoder stage at 1/4 resolution (2.5.0)
+
+Profiling v4 at 512 px showed the decoder still took half of the time, mostly
+its half-resolution stage. v5 runs that stage on the 1/4-resolution grid and
+keeps the 8-channel full-resolution refinement driven by the image, so edges
+stay pixel accurate. Same benchmark as above:
+
+| | IoU 96 | IoU 160x128 | alpha L1 | train ms/step (batch 8 / 2) |
+|---|---|---|---|---|
+| Color v4 | 0.968 | 0.971 | 0.029 | 164 / 71 |
+| **Color v5** | 0.968 | 0.971 | 0.029 | **138 / 66** |
+| Background v4 | 0.964 | 0.953 | 0.033 | 167 / 80 |
+| **Background v5** | 0.966 | 0.956 | 0.030 | **150 / 76** |
+| Background v4, batch 2 x 4 | 0.965 | 0.958 | 0.035 | |
+| **Background v5, batch 2 x 4** | 0.968 | 0.959 | 0.032 | |
+
+Accuracy is unchanged (differences are within run-to-run noise, about 0.3
+point). Transformer depth was also measured with v5 (background): 6 blocks
+0.965 / 0.953, 12 blocks 0.966 / 0.955, 8 untied blocks (2.4M parameters)
+0.965 / 0.960; none is clearly better than the default 8 blocks tied after 4,
+so the default stays.
+
 For v2 models used at another resolution than their training one,
 `model.set_pos_grid((10, 10))` (grid of a 160x160 training) interpolates the
 learned positions in 2D: identical output at the training resolution, correct
@@ -250,7 +293,12 @@ Inference speed of new models (random weights, `optimize_for_inference`, 4 threa
 |---|---|---|---|
 | v2 color | 27 ms | 93 ms | 254 ms |
 | v3 color | 18 ms | 53 ms | 135 ms |
-| **v4 color** | 16 ms | 46 ms | 133 ms |
+| v4 color | 16 ms | 56 ms | 120 ms |
+| **v5 color** | 15 ms | 45 ms | 99 ms |
+| v4 background | 16 ms | 45 ms | 109 ms |
+| **v5 background** | 14 ms | 37 ms | 86 ms |
+
+(v4 and v5 rows measured in the same run; v2/v3 rows come from 2.4.0.)
 
 Edge refinement: `predict_mask(..., refine="guided")` / `predict --refine guided`
 applies a guided filter (chroma-distance guide for color models, luminance for

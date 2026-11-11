@@ -469,7 +469,7 @@ class TrainConfig:
     out_dir: str = "runs/codelor"
     init_from: str | None = None         # local dir or HF repo to fine-tune from
     resume: bool = True                  # resume from out_dir/last.pt if present
-    # Architecture preset ("v2" original / "v3" / "v4" recommended). None: "v4" from
+    # Architecture preset ("v2" original / "v3" / "v4" / "v5" recommended). None: "v5" from
     # scratch, the checkpoint's own architecture with init_from. An explicit
     # preset with init_from converts the checkpoint (matching weights reused).
     preset: str | None = None
@@ -501,7 +501,7 @@ class TrainConfig:
     augment: bool = True
     edge_weight: float = 1.0             # extra BCE weight on mask borders (0 = off)
     multiscale: bool | None = None       # random 0.75-1.25x batch rescale; None: on for
-                                         # resolution-independent models (v3/v4, pos_grid)
+                                         # resolution-independent models (v3+, pos_grid)
 
     log_every: int = 10
     save_every: int = 200                # optimizer steps between checkpoints
@@ -608,6 +608,8 @@ class Trainer:
         self.out = Path(c.out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
 
+        #: State-dict keys loaded from ``init_from`` (None: all of them).
+        self._pretrained_keys: set[str] | None = None
         self.model = self._build_model().to(self.device)
         self.model.set_grad_checkpointing(c.grad_checkpointing)
         small_batch = int(c.batch_size or 1) < 8
@@ -659,7 +661,7 @@ class Trainer:
     def _build_model(self) -> CodelorColor:
         c = self.cfg
         if not c.init_from:
-            model = build_model(c.task, preset=c.preset or "v4", **c.model)
+            model = build_model(c.task, preset=c.preset or "v5", **c.model)
             if model.pos_mode == "learned":
                 # Record the training token grid: other resolutions then get
                 # interpolated (correct) positions instead of a wrong flat index.
@@ -673,6 +675,7 @@ class Trainer:
             hyper = {k: v for k, v in src.config().items() if k in HYPERPARAM_KEYS}
             model = build_model(c.task, preset=c.preset, **hyper)
             copied = transfer_weights(src, model)
+            self._pretrained_keys = set(copied)
             self.log(f"Converted {c.init_from} to preset {c.preset}: "
                      f"{len(copied)}/{len(model.state_dict())} tensors reused")
             return model
@@ -682,15 +685,27 @@ class Trainer:
             self.log(f"Initializing background model from color checkpoint {c.init_from}")
             return CodelorBackground.from_color_model(src)
         model = build_model(c.task, **src.config())
-        transfer_weights(src, model)
+        self._pretrained_keys = set(transfer_weights(src, model))
         return model
 
     def _train_mode(self) -> None:
         self.model.train()
         if self.freeze_bn:
-            for m in self.model.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.eval()
+            # Only layers whose statistics came from the checkpoint: new layers
+            # (e.g. after a preset conversion) still need to learn theirs.
+            # A layer counts as pretrained if its statistics and the convolution
+            # feeding it (previous entry of its nn.Sequential) were both loaded.
+            keys = self._pretrained_keys
+            state = self.model.state_dict()
+            for name, m in self.model.named_modules():
+                if not isinstance(m, nn.BatchNorm2d):
+                    continue
+                if keys is not None:
+                    parent, _, idx = name.rpartition(".")
+                    prev = f"{parent}.{int(idx) - 1}.weight" if idx.isdigit() else ""
+                    if f"{name}.running_mean" not in keys or (prev in state and prev not in keys):
+                        continue
+                m.eval()
 
     def _lr_lambda(self, step: int) -> float:
         warm = max(1, self.cfg.warmup_steps)
